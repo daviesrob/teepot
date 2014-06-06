@@ -8,18 +8,54 @@
 #include <poll.h>
 #include <signal.h>
 #include <assert.h>
+#include <unistd.h>
+
+/* Options */
+typedef struct {
+  size_t      max;      /* Maximum amount of data to keep in memory */
+  off_t       file_max; /* Maximum size of each temp file */
+  const char *tmp_dir;  /* Where to write spilled data */
+  const char *in_name;  /* Name of input file */
+} Opts;
+
+#ifndef DEFAULT_MAX
+#  define DEFAULT_MAX      (1024*1024*100)
+#endif
+#ifndef DEFAULT_FILE_MAX
+#  define DEFAULT_FILE_MAX (DEFAULT_MAX * 10)
+#endif
+#ifndef DEFAULT_TMP_DIR
+#  define DEFAULT_TMP_DIR  "/tmp"
+#endif
+
+/* Temporary file */
+typedef struct TmpFile {
+  struct TmpFile *next;
+  off_t           offset;
+  size_t          ref_count;
+  int             fd;
+} TmpFile;
 
 /* A chunk of input */
 
 typedef struct Chunk {
   unsigned char *data;
-  size_t len;
-  size_t ref_count;
+  size_t   len;
+  size_t   ref_count;
+  off_t    tmp_offset;
+  TmpFile *tmp;
   struct Chunk *next;
 } Chunk;
 
 /* Chunk size to use */
 #define CHUNK_SZ (1024*1024)
+
+/* The input */
+typedef struct {
+  int      fd;
+  int      reg;
+  TmpFile *tmp;
+} Input;
 
 /* An output */
 
@@ -39,7 +75,7 @@ typedef struct {
  *        -1 on error
  */
 
-static int file_is_regular(char *name, int fd) {
+static int file_is_regular(const char *name, int fd) {
   struct stat sbuf;
 
   if (0 != fstat(fd, &sbuf)) {
@@ -49,6 +85,39 @@ static int file_is_regular(char *name, int fd) {
   }
 
   return S_ISREG(sbuf.st_mode) ? 1 : 0;
+}
+
+/*
+ * Open the input file and set up the Input struct
+ *
+ * *options  is the Opt struct with the input file name
+ * *in       is the Input struct to fill in
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+int open_input(Opts *options, Input *in) {
+  if (NULL == options->in_name || 0 == strcmp(options->in_name, "-")) {
+    /* Read from stdin */
+    options->in_name = "stdin";
+    in->fd = fileno(stdin);
+  } else {
+    /* Read from named file */
+    in->fd = open(options->in_name, O_RDONLY);
+    if (in->fd < 0) {
+      fprintf(stderr, "Couldn't open %s : %s\n",
+	      options->in_name, strerror(errno));
+      return -1;
+    }
+  }
+
+  /* Check if input is a regular file */
+  in->reg = file_is_regular(options->in_name, in->fd);
+  if (in->reg < 0) return -1;
+  in->tmp = NULL;
+
+  return 0;
 }
 
 /*
@@ -121,7 +190,7 @@ static int open_outputs(int n, char **names, Output *outputs,
  *         -1 in failure
  */
 
-static ssize_t do_read(char *in_name, int in_fd,
+static ssize_t do_read(Opts *options, Input *in,
 		       Chunk **tail_p, int *read_eof, int nrefs) {
   Chunk *tail = *tail_p;
   ssize_t bytes;
@@ -129,7 +198,6 @@ static ssize_t do_read(char *in_name, int in_fd,
   if (tail->len == CHUNK_SZ) {
     /* Need to start a new Chunk */
     Chunk *new_tail = calloc(1, sizeof(Chunk));
-    unsigned char *shrink_data;
     if (NULL == new_tail) {
       perror("do_read");
       return -1;
@@ -152,12 +220,13 @@ static ssize_t do_read(char *in_name, int in_fd,
 
   /* Read some data */ 
   do {
-    bytes = read(in_fd, tail->data + tail->len, CHUNK_SZ - tail->len);
+    bytes = read(in->fd, tail->data + tail->len, CHUNK_SZ - tail->len);
   } while (bytes < 0 && errno == EINTR);
   
   if (bytes < 0) { /* Error */
     if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; /* Blocking is OK */
-    fprintf(stderr, "Error reading %s : %s\n", in_name, strerror(errno));
+    fprintf(stderr, "Error reading %s : %s\n",
+	    options->in_name, strerror(errno));
     return -1;
   }
 
@@ -255,7 +324,7 @@ static ssize_t do_write(Output *output, int nclosed) {
  *         -1 on failure
  */
 
-static int do_copy(char *in_name, int in_fd, int in_reg,
+static int do_copy(Opts *options, Input *in,
 		   int noutputs, Output *outputs,
 		   int nregular, int *regular,
 		   int npipes, int *pipes) {
@@ -291,12 +360,12 @@ static int do_copy(char *in_name, int in_fd, int in_reg,
     int should_read = !read_eof && (npipes == 0 || keeping_up > 0);
 
     if (should_read) {
-      if (in_reg) {
+      if (in->reg) {
 	/* If reading a regular file, do it now */
-	if (0 != do_read(in_name, in_fd, &tail, &read_eof, noutputs)) return -1;
+	if (0 != do_read(options, in, &tail, &read_eof, noutputs)) return -1;
       } else {
 	/* Otherwise add it to the poll list */
-	polls[npolls].fd = in_fd;
+	polls[npolls].fd = in->fd;
 	poll_idx[npolls] = -1;
 	polls[npolls].events = POLLIN;
 	polls[npolls++].revents = 0;
@@ -332,14 +401,13 @@ static int do_copy(char *in_name, int in_fd, int in_reg,
 	  
 	  --ready;
 	  if (poll_idx[i] < 0) {  /* Input, try to read from it. */
-	    if (0 != do_read(in_name, in_fd, &tail, &read_eof, noutputs)) {
+	    if (0 != do_read(options, in, &tail, &read_eof, noutputs)) {
 	      return -1;
 	    }
 
 	  } else {  /* Output, try to write to it. */
 	    Output *output = &outputs[pipes[poll_idx[i]]];
 	    ssize_t res = do_write(output, nclosed);
-	    int j, k;
 
 	    if (-2 == res) { /* Got EPIPE, add to closing_pipes list */
 	      closing_pipes[pipe_close++] = poll_idx[i];
@@ -382,7 +450,6 @@ static int do_copy(char *in_name, int in_fd, int in_reg,
 
     for (i = 0; i < reg_close; i++) {
       int to_close = regular[closing_reg[i]];
-      int j, k;
 
       if (0 != close(outputs[to_close].fd)) {
 	fprintf(stderr, "Error closing %s : %s\n",
@@ -404,7 +471,7 @@ static int do_copy(char *in_name, int in_fd, int in_reg,
 
     for (i = 0; i < pipe_close; i++) {
       int to_close = pipes[closing_pipes[i]];
-      int j, k;
+
       if (0 != close(outputs[to_close].fd)) {
 	fprintf(stderr, "Error closing %s : %s\n",
 		outputs[to_close].name, strerror(errno));
@@ -424,10 +491,102 @@ static int do_copy(char *in_name, int in_fd, int in_reg,
   return 0;
 }
 
+void show_usage(char *prog) {
+  fprintf(stderr, "Usage: %s [-m <limit>] [-f <limit>] [-t temp_dir]\n", prog);
+}
+
+/*
+ * Parse a size option.  This is a number followed optionally by one of
+ * the letters [TtGgMmKk].  The number is scaled as suggested by the suffix
+ * letter.
+ *
+ * *in is the input string
+ * *sz_out is the output size in bytes
+ *
+ * Returns  0 on success
+ *         -1 if the input did not start with a number or the suffix was invalid
+ */
+
+int parse_size_opt(char *in, size_t *sz_out) {
+  unsigned long ul;
+  char *endptr = in;
+  size_t sz;
+
+  ul = strtoul(in, &endptr, 10);
+  if (endptr == in) return -1;
+  sz = ul;
+
+  switch(*endptr) {
+  case 'T': case 't':
+    sz *= 1024;
+    if (sz < ul) return -1;
+  case 'G': case 'g':
+    sz *= 1024;
+    if (sz < ul) return -1;
+  case 'M': case 'm':
+    sz *= 1024;
+    if (sz < ul) return -1;
+  case 'K': case 'k':
+    sz *= 1024;
+    if (sz < ul) return -1;
+  case '\0':
+    break;
+  default:
+    return -1;
+  }
+  return 0;
+}
+
+int get_options(int argc, char** argv, Opts *options, int *after_opts) {
+  int opt;
+  size_t sz;
+
+  options->max      = DEFAULT_MAX;
+  options->file_max = DEFAULT_FILE_MAX;
+  options->tmp_dir  = DEFAULT_TMP_DIR;
+  options->in_name  = NULL;
+
+  while ((opt = getopt(argc, argv, "m:f:t:i:")) != -1) {
+    switch (opt) {
+
+    case 'i':
+      options->in_name = optarg;
+      break;
+
+    case 'f':
+      if (0 != parse_size_opt(optarg, &sz)) {
+	fprintf(stderr, "Couldn't understand file size limit '%s'\n", optarg);
+	return -1;
+      }
+      options->file_max = sz;
+      break;
+
+    case 'm':
+      if (0 != parse_size_opt(optarg, &sz)) {
+	fprintf(stderr, "Couldn't understand memory limit '%s'\n", optarg);
+	return -1;
+      }
+      options->max = sz;
+      break;
+
+    case 't':
+      options->tmp_dir = optarg;
+      break;
+
+    default:
+      show_usage(argv[0]);
+      return -1;
+    }
+  }
+
+  *after_opts = optind;
+  return 0;
+}
+
 int main(int argc, char** argv) {
-  int     in_fd   = fileno(stdin);
-  char   *in_name = "stdin";
-  int     in_reg;
+  Opts    options;
+  int     out_start = argc;
+  Input   in = { -1, 0, NULL };
   Output *outputs = malloc((argc - 1) * sizeof(Output));
   int    *regular = malloc((argc - 1) * sizeof(int));
   int    *pipes   = malloc((argc - 1) * sizeof(int));
@@ -446,20 +605,30 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  /* Check if input is a regular file */
-  in_reg = file_is_regular(in_name, in_fd);
-  if (in_reg < 0) return EXIT_FAILURE;
+  if (0 != get_options(argc, argv, &options, &out_start)) {
+    return EXIT_FAILURE;
+  }
+
+  if (0 != open_input(&options, &in)) {
+    return EXIT_FAILURE;
+  }
+
+  if (out_start >= argc) {
+    fprintf(stderr, "No output files specified\n");
+    return EXIT_FAILURE;
+  }
 
   /* Open the output files */
-  if (open_outputs(argc - 1, argv + 1, outputs,
+  if (open_outputs(argc - out_start, argv + out_start, outputs,
 		   regular, pipes, &nregular, &npipes) != 0) {
     return EXIT_FAILURE;
   }
   
   /* Copy input to all outputs */
-  if (do_copy(in_name, in_fd, in_reg, argc - 1, outputs,
+  if (do_copy(&options, &in, argc - out_start, outputs,
 	      nregular, regular, npipes, pipes) != 0) {
     return EXIT_FAILURE;
   }
 
+  return EXIT_SUCCESS;
 }
