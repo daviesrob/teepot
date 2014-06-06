@@ -106,6 +106,34 @@ static int file_is_regular(const char *name, int fd) {
 }
 
 /*
+ * Set a file descriptor to non-blocking mode
+ *
+ * *name is the name of the file (for error reporting)
+ * fd    is the descriptor
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+static int setnonblock(const char *name, int fd) {
+  int val;
+
+  if ((val = fcntl(fd, F_GETFL)) == -1) {
+    fprintf(stderr, "Couldn't get file descriptor flags for %s : %s",
+	    name, strerror(errno));
+    return -1;
+  }
+  
+  if (fcntl(fd, F_SETFL, val | O_NONBLOCK)) {
+    fprintf(stderr, "Couldn't set %s to non-blocking mode : %s",
+	    name, strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+
+/*
  * Open the input file and set up the Input struct
  *
  * *options  is the Opt struct with the input file name
@@ -133,6 +161,11 @@ int open_input(Opts *options, Input *in) {
   /* Check if input is a regular file */
   in->reg = file_is_regular(options->in_name, in->fd);
   if (in->reg < 0) return -1;
+  
+  if (!in->reg) {
+    if (0 != setnonblock(options->in_name, in->fd)) return -1;
+  }
+
   in->tmp = NULL;
 
   return 0;
@@ -184,6 +217,7 @@ static int open_outputs(int n, char **names, Output *outputs,
       regular[(*nregular)++] = i;
     } else {
       pipes[(*npipes)++] = i;
+      if (0 != setnonblock(names[i], outputs[i].fd)) return -1;
     }
 
     /* Initialize the pointer to the data to output */
