@@ -58,10 +58,11 @@ typedef struct TmpFile {
 
 typedef struct Chunk {
   unsigned char *data;
-  size_t   len;
-  size_t   ref_count;
-  off_t    tmp_offset;
-  TmpFile *tmp;
+  size_t         len;
+  unsigned int   ref_count;
+  unsigned int   nwriters;
+  off_t          tmp_offset;
+  TmpFile       *tmp;
   struct Chunk *next;
 } Chunk;
 
@@ -227,6 +228,56 @@ static int open_outputs(int n, char **names, Output *outputs,
   return 0;
 }
 
+/*
+ * Release a temporary file
+ * Decerement the reference count, and if it hits zero close the file.
+ *
+ * *tmp if the TmpFile to release
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+int release_tmp(TmpFile *tmp) {
+  if (--tmp->ref_count > 0) return 0;  /* Still in use */
+
+  if (0 != close(tmp->fd)) {
+    perror("Closing temporary file");
+    return -1;
+  }
+
+  free(tmp);
+
+  return 0;
+}
+
+/*
+ * Allocate a new Chunk, and update the linked list and tail pointers to
+ * point to it.
+ *
+ * **tail_p is the location of the pointer to the existing tail end of the list.
+ * nrefs is the initial reference count
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+static int new_chunk(Chunk **tail_p, int nrefs) {
+  /* Allocate a new Chunk */
+  Chunk *new_tail = calloc(1, sizeof(Chunk));
+  if (NULL == new_tail) {
+    perror("new_chunk");
+    return -1;
+  }
+
+  /* Initialize and make it the new tail */
+  new_tail->ref_count = nrefs;
+  (*tail_p)->next = new_tail;
+  *tail_p = new_tail;
+
+  return 0;
+}
+
 /* 
  * Read some data into the tail Chunk.  If it's full, make a new chunk
  * first and read into that.  If the end of the input file is read,
@@ -242,23 +293,14 @@ static int open_outputs(int n, char **names, Output *outputs,
  *         -1 in failure
  */
 
-static ssize_t do_read(Opts *options, Input *in,
+static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
 		       Chunk **tail_p, int *read_eof, int nrefs) {
   Chunk *tail = *tail_p;
   ssize_t bytes;
 
   if (tail->len == CHUNK_SZ) {
     /* Need to start a new Chunk */
-    Chunk *new_tail = calloc(1, sizeof(Chunk));
-    if (NULL == new_tail) {
-      perror("do_read");
-      return -1;
-    }
-
-    /* Initialize and make it the new tail */
-    new_tail->ref_count = nrefs;
-    tail->next = new_tail;
-    tail = *tail_p = new_tail;
+    if (0 != new_chunk(tail_p, nrefs)) return -1;
   }
 
   if (NULL == tail->data) {
@@ -268,6 +310,7 @@ static ssize_t do_read(Opts *options, Input *in,
       perror("do_read");
       return -1;
     }
+    *alloced += CHUNK_SZ;
   }
 
   /* Read some data */ 
@@ -304,12 +347,12 @@ static ssize_t do_read(Opts *options, Input *in,
  *         -2 on EPIPE
  */
 
-static ssize_t do_write(Output *output, int nclosed) {
+static ssize_t do_write(Output *output, size_t *alloced, int nclosed) {
   ssize_t bytes = 0;
   Chunk *curr_chunk = output->curr_chunk;
 
   while (curr_chunk->next != NULL || output->offset < curr_chunk->len) {
-    /* While there's somethign to write ... */
+    /* While there's something to write ... */
 
     if (output->offset < curr_chunk->len) {
       /* Data available in the current Chunk */
@@ -347,13 +390,19 @@ static ssize_t do_write(Output *output, int nclosed) {
       output->curr_chunk = curr_chunk->next;
       output->offset = 0;
 
+      --curr_chunk->nwriters;
       if (--curr_chunk->ref_count <= nclosed) {
 	/* If no more readers for the current Chunk, free it */
+	if (NULL != curr_chunk->tmp) {
+	  if (0 != release_tmp(curr_chunk->tmp)) return -1;
+	}
 	free(curr_chunk->data);
+	*alloced -= CHUNK_SZ;
 	free(curr_chunk);
       }
 
       curr_chunk = output->curr_chunk;
+      curr_chunk->nwriters++;
     }
   }
   return bytes;
@@ -386,6 +435,7 @@ static int do_copy(Opts *options, Input *in,
   int   *closing_pipes; /* Pipes that need to be closed */
   int   *closing_reg;   /* Regular files that need to be closed */
   int i, keeping_up = npipes, read_eof = 0, nclosed = 0;
+  size_t alloced = 0;  /* Amount of data storage currently allocated */
 
   tail          = calloc(1, sizeof(Chunk));  /* Initial empty Chunk */
   polls         = malloc((noutputs + 1) * sizeof(struct pollfd));
@@ -399,6 +449,7 @@ static int do_copy(Opts *options, Input *in,
   }
 
   tail->ref_count = noutputs;
+  tail->nwriters  = noutputs;
 
   /* Point all outputs to the initial Chunk */
   for (i = 0; i < noutputs; i++) {
@@ -414,7 +465,9 @@ static int do_copy(Opts *options, Input *in,
     if (should_read) {
       if (in->reg) {
 	/* If reading a regular file, do it now */
-	if (0 != do_read(options, in, &tail, &read_eof, noutputs)) return -1;
+	if (0 != do_read(options, in, &alloced, &tail, &read_eof, noutputs)) {
+	  return -1;
+	}
       } else {
 	/* Otherwise add it to the poll list */
 	polls[npolls].fd = in->fd;
@@ -453,13 +506,14 @@ static int do_copy(Opts *options, Input *in,
 	  
 	  --ready;
 	  if (poll_idx[i] < 0) {  /* Input, try to read from it. */
-	    if (0 != do_read(options, in, &tail, &read_eof, noutputs)) {
+	    if (0 != do_read(options, in, &alloced, &tail,
+			     &read_eof, noutputs)) {
 	      return -1;
 	    }
 
 	  } else {  /* Output, try to write to it. */
 	    Output *output = &outputs[pipes[poll_idx[i]]];
-	    ssize_t res = do_write(output, nclosed);
+	    ssize_t res = do_write(output, &alloced, nclosed);
 
 	    if (-2 == res) { /* Got EPIPE, add to closing_pipes list */
 	      closing_pipes[pipe_close++] = poll_idx[i];
@@ -488,7 +542,7 @@ static int do_copy(Opts *options, Input *in,
 
     for (i = 0; i < nregular; i++) {
       /* Try to write */
-      if (do_write(&outputs[regular[i]], nclosed) < 0) return -1;
+      if (do_write(&outputs[regular[i]], &alloced, nclosed) < 0) return -1;
 
       if (read_eof
 	  && outputs[regular[i]].curr_chunk == tail
