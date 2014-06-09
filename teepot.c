@@ -69,6 +69,12 @@ typedef struct Chunk {
 /* Chunk size to use */
 #define CHUNK_SZ (1024*1024)
 
+typedef struct ChunkList {
+  Chunk *head;    /* List head */
+  Chunk *spilled; /* Last chunk to be spilled to a file */
+  Chunk *tail;    /* List tail */
+} ChunkList;
+
 /* The input */
 typedef struct {
   int      fd;
@@ -262,7 +268,7 @@ int release_tmp(TmpFile *tmp) {
  *         -1 on failure
  */
 
-static int new_chunk(Chunk **tail_p, int nrefs) {
+static int new_chunk(ChunkList *chunks, int nrefs) {
   /* Allocate a new Chunk */
   Chunk *new_tail = calloc(1, sizeof(Chunk));
   if (NULL == new_tail) {
@@ -272,8 +278,8 @@ static int new_chunk(Chunk **tail_p, int nrefs) {
 
   /* Initialize and make it the new tail */
   new_tail->ref_count = nrefs;
-  (*tail_p)->next = new_tail;
-  *tail_p = new_tail;
+  chunks->tail->next = new_tail;
+  chunks->tail = new_tail;
 
   return 0;
 }
@@ -294,19 +300,18 @@ static int new_chunk(Chunk **tail_p, int nrefs) {
  */
 
 static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
-		       Chunk **tail_p, int *read_eof, int nrefs) {
-  Chunk *tail = *tail_p;
+		       ChunkList *chunks, int *read_eof, int nrefs) {
   ssize_t bytes;
 
-  if (tail->len == CHUNK_SZ) {
+  if (chunks->tail->len == CHUNK_SZ) {
     /* Need to start a new Chunk */
-    if (0 != new_chunk(tail_p, nrefs)) return -1;
+    if (0 != new_chunk(chunks, nrefs)) return -1;
   }
 
-  if (NULL == tail->data) {
+  if (NULL == chunks->tail->data) {
     /* Allocate a buffer to put the data in */
-    tail->data = malloc(CHUNK_SZ);
-    if (NULL == tail->data) {
+    chunks->tail->data = malloc(CHUNK_SZ);
+    if (NULL == chunks->tail->data) {
       perror("do_read");
       return -1;
     }
@@ -315,7 +320,8 @@ static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
 
   /* Read some data */ 
   do {
-    bytes = read(in->fd, tail->data + tail->len, CHUNK_SZ - tail->len);
+    bytes = read(in->fd, chunks->tail->data + chunks->tail->len,
+		 CHUNK_SZ - chunks->tail->len);
   } while (bytes < 0 && errno == EINTR);
   
   if (bytes < 0) { /* Error */
@@ -331,7 +337,7 @@ static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
   }
 
   /* Got some data, update length */
-  tail->len += bytes;
+  chunks->tail->len += bytes;
 
   return 0;
 }
@@ -347,7 +353,8 @@ static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
  *         -2 on EPIPE
  */
 
-static ssize_t do_write(Output *output, size_t *alloced, int nclosed) {
+static ssize_t do_write(Output *output, ChunkList *chunks,
+			size_t *alloced, int nclosed) {
   ssize_t bytes = 0;
   Chunk *curr_chunk = output->curr_chunk;
 
@@ -393,6 +400,9 @@ static ssize_t do_write(Output *output, size_t *alloced, int nclosed) {
       --curr_chunk->nwriters;
       if (--curr_chunk->ref_count <= nclosed) {
 	/* If no more readers for the current Chunk, free it */
+	assert(curr_chunk == chunks->head); /* Should be head of list */
+	chunks->head = curr_chunk->next;
+	if (curr_chunk == chunks->spilled) chunks->spilled = NULL;
 	if (NULL != curr_chunk->tmp) {
 	  if (0 != release_tmp(curr_chunk->tmp)) return -1;
 	}
@@ -429,7 +439,7 @@ static int do_copy(Opts *options, Input *in,
 		   int noutputs, Output *outputs,
 		   int nregular, int *regular,
 		   int npipes, int *pipes) {
-  Chunk *tail;          /* tail Chunk (the one currently being written to) */
+  ChunkList chunks = { NULL, NULL, NULL }; /* Linked list of Chunks */ 
   struct pollfd *polls; /* structs for poll(2) */
   int   *poll_idx;    /* indexes in outputs corresponding to entries in polls */
   int   *closing_pipes; /* Pipes that need to be closed */
@@ -437,23 +447,23 @@ static int do_copy(Opts *options, Input *in,
   int i, keeping_up = npipes, read_eof = 0, nclosed = 0;
   size_t alloced = 0;  /* Amount of data storage currently allocated */
 
-  tail          = calloc(1, sizeof(Chunk));  /* Initial empty Chunk */
+  chunks.head = chunks.tail = calloc(1, sizeof(Chunk));  /* Initial Chunk */
   polls         = malloc((noutputs + 1) * sizeof(struct pollfd));
   poll_idx      = malloc((noutputs + 1) * sizeof(int));
   closing_pipes = malloc((npipes + 1)   * sizeof(int));
   closing_reg   = malloc((nregular + 1) * sizeof(int));
-  if (NULL == tail || NULL == polls || NULL == poll_idx
+  if (NULL == chunks.head || NULL == polls || NULL == poll_idx
       || NULL == closing_pipes || NULL == closing_reg) {
     perror("do_copy");
     return -1;
   }
 
-  tail->ref_count = noutputs;
-  tail->nwriters  = noutputs;
+  chunks.head->ref_count = noutputs;
+  chunks.head->nwriters  = noutputs;
 
   /* Point all outputs to the initial Chunk */
   for (i = 0; i < noutputs; i++) {
-    outputs[i].curr_chunk = tail;
+    outputs[i].curr_chunk = chunks.head;
   }
 
   do {  /* Main loop */
@@ -465,7 +475,7 @@ static int do_copy(Opts *options, Input *in,
     if (should_read) {
       if (in->reg) {
 	/* If reading a regular file, do it now */
-	if (0 != do_read(options, in, &alloced, &tail, &read_eof, noutputs)) {
+	if (0 != do_read(options, in, &alloced, &chunks, &read_eof, noutputs)) {
 	  return -1;
 	}
       } else {
@@ -479,8 +489,8 @@ static int do_copy(Opts *options, Input *in,
 
     /* Add all the pipe outputs that have something to write to the poll list */
     for (i = 0; i < npipes; i++) {
-      if (outputs[pipes[i]].curr_chunk != tail
-	  || outputs[pipes[i]].offset < tail->len
+      if (outputs[pipes[i]].curr_chunk != chunks.tail
+	  || outputs[pipes[i]].offset < chunks.tail->len
 	  || read_eof) { /* always after read_eof so we finish */
 	polls[npolls].fd = outputs[pipes[i]].fd;
 	poll_idx[npolls] = i;
@@ -506,14 +516,14 @@ static int do_copy(Opts *options, Input *in,
 	  
 	  --ready;
 	  if (poll_idx[i] < 0) {  /* Input, try to read from it. */
-	    if (0 != do_read(options, in, &alloced, &tail,
+	    if (0 != do_read(options, in, &alloced, &chunks,
 			     &read_eof, noutputs)) {
 	      return -1;
 	    }
 
 	  } else {  /* Output, try to write to it. */
 	    Output *output = &outputs[pipes[poll_idx[i]]];
-	    ssize_t res = do_write(output, &alloced, nclosed);
+	    ssize_t res = do_write(output, &chunks, &alloced, nclosed);
 
 	    if (-2 == res) { /* Got EPIPE, add to closing_pipes list */
 	      closing_pipes[pipe_close++] = poll_idx[i];
@@ -522,7 +532,8 @@ static int do_copy(Opts *options, Input *in,
 	      return -1;
 	    }
 
-	    if (output->curr_chunk == tail && output->offset == tail->len) {
+	    if (output->curr_chunk == chunks.tail
+		&& output->offset == chunks.tail->len) {
 	      /* All the data so far has been written to this output */
 	      if (read_eof) {
 		/* If finished reading, add to closing_pipes */
@@ -542,11 +553,13 @@ static int do_copy(Opts *options, Input *in,
 
     for (i = 0; i < nregular; i++) {
       /* Try to write */
-      if (do_write(&outputs[regular[i]], &alloced, nclosed) < 0) return -1;
+      if (do_write(&outputs[regular[i]], &chunks, &alloced, nclosed) < 0) {
+	return -1;
+      }
 
       if (read_eof
-	  && outputs[regular[i]].curr_chunk == tail
-	  && outputs[regular[i]].offset == tail->len) {
+	  && outputs[regular[i]].curr_chunk == chunks.tail
+	  && outputs[regular[i]].offset == chunks.tail->len) {
 	/* If all data written and finished reading, add to closing_reg list */
 	closing_reg[reg_close++] = i;
       }
