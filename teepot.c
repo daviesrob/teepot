@@ -16,6 +16,9 @@
  * this program. If not, see <http://www.gnu.org/licenses>
  */
 
+#ifdef HAVE_CONFIG_H
+#  include <teepot_config.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -936,7 +939,7 @@ static int do_copy(Opts *options, Input *in,
 }
 
 /*
- * Show the usage meesage
+ * Show the usage message
  *
  * prog is the program name
  */

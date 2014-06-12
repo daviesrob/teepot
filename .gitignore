@@ -1,3 +1,26 @@
+# Backup files
 *~
 
+# The program
 teepot
+
+# object files
+*.o
+
+# Dependency tracking
+.deps/
+
+# autoconf/automake stuff
+Makefile
+Makefile.in
+aclocal.m4
+autom4te.cache/
+teepot_config.h
+teepot_config.h.in
+config.log
+config.status
+configure
+depcomp
+install-sh
+missing
+stamp-h1
