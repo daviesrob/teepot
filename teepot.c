@@ -34,6 +34,7 @@ typedef struct {
   off_t       file_max; /* Maximum size of each temp file */
   const char *tmp_dir;  /* Where to write spilled data */
   const char *in_name;  /* Name of input file */
+  size_t      tmp_dir_len; /* strlen(tmp_dir) */
 } Opts;
 
 #ifndef DEFAULT_MAX
@@ -46,24 +47,24 @@ typedef struct {
 #  define DEFAULT_TMP_DIR  "/tmp"
 #endif
 
-/* Temporary file */
-typedef struct TmpFile {
-  struct TmpFile *next;
-  off_t           offset;
-  size_t          ref_count;
-  int             fd;
-} TmpFile;
+/* File to spill data to */
+typedef struct SpillFile {
+  off_t   offset;     /* Current temp file offset */
+  size_t  ref_count;  /* Number of Chunks that reference this file */
+  int     fd;         /* File descriptor */
+  int     is_tmp;     /* 1: fd is a temporary file; 0: fd is the input file */ 
+} SpillFile;
 
 /* A chunk of input */
 
 typedef struct Chunk {
-  unsigned char *data;
-  size_t         len;
-  unsigned int   ref_count;
-  unsigned int   nwriters;
-  off_t          tmp_offset;
-  TmpFile       *tmp;
-  struct Chunk *next;
+  unsigned char *data;          /* The data */
+  size_t         len;           /* Length of data */
+  unsigned int   ref_count;     /* Number of outputs that refer to this */
+  unsigned int   nwriters;      /* Number of outputs currently writing this */
+  off_t          spill_offset;  /* Offset into spill file */
+  SpillFile     *spill;         /* Spill file */
+  struct Chunk  *next;          /* Next Chunk in the list */
 } Chunk;
 
 /* Chunk size to use */
@@ -77,24 +78,29 @@ typedef struct ChunkList {
 
 /* The input */
 typedef struct {
-  int      fd;
-  int      reg;
-  TmpFile *tmp;
+  off_t    pos;      /* Total bytes read so far */
+  int      fd;       /* File descriptor */
+  int      reg;      /* Input is a regular file */
+  SpillFile *spill;  /* The current file to spill to */
 } Input;
 
 /* An output */
 
 typedef struct {
-  char  *name;
-  int    fd;
-  int    is_reg;
-  Chunk *curr_chunk;
-  size_t offset;
+  char  *name;       /* Output file name */
+  int    fd;         /* Output file descriptor */
+  int    is_reg;     /* Output is regular */
+  Chunk *curr_chunk; /* Current Chunk being written */
+  size_t offset;     /* Offset into current Chunk */
 } Output;
 
 
 /*
  * Check if a file descriptor points to a regular file, i.e. not poll-able
+ *
+ * name is the filename (for error reporting)
+ * fd   is the file descriptor
+ *
  * Returns 1 if regular
  *         0 if not
  *        -1 on error
@@ -170,10 +176,24 @@ int open_input(Opts *options, Input *in) {
   if (in->reg < 0) return -1;
   
   if (!in->reg) {
+    /* Set input pipes to non-blocking mode */
     if (0 != setnonblock(options->in_name, in->fd)) return -1;
+    /* Can't use input for spilling */
+    in->spill = NULL;
+  } else {
+    /* Use input file for spillage */
+    in->spill = malloc(sizeof(SpillFile));
+    if (NULL == in->spill) {
+      perror("open_input");
+      return -1;
+    }
+    in->spill->offset    = 0;
+    in->spill->ref_count = 1;
+    in->spill->fd        = in->fd;
+    in->spill->is_tmp    = 0;
   }
 
-  in->tmp = NULL;
+  in->pos = 0;
 
   return 0;
 }
@@ -235,25 +255,229 @@ static int open_outputs(int n, char **names, Output *outputs,
 }
 
 /*
+ * Open a new temporary file.
+ *
+ * *options is the Opts struct with the name of the temporary directory.
+ * *current is the last SpillFile, used if we run out of file descriptors
+ *
+ * Returns a pointer to the new SpillFile struct on success
+ *         NULL on failure
+ */
+
+static SpillFile * make_tmp_file(Opts *options, SpillFile *current) {
+  SpillFile *spill = malloc(sizeof(SpillFile));
+  char    *name = malloc(options->tmp_dir_len + 15);
+  static int warned = 0;
+
+  if (NULL == spill || NULL == name) {
+    perror("make_tmp_file");
+    return NULL;
+  }
+
+  /* Open a new temporary file */
+  snprintf(name, options->tmp_dir_len + 14, "%s/tpXXXXXX", options->tmp_dir);
+  spill->fd = mkstemp(name);
+  if (spill->fd < 0) {
+    free(spill);
+    free(name);
+    if ((EMFILE == errno || ENFILE == errno) && NULL != current) {
+      /* Out of file descriptors, just keep going with the current one */
+      if (!warned) {
+	perror("Warning: Couldn't open new temporary file");
+	warned = 1;
+      }
+      return current;
+    }
+    perror("Opening temporary file");
+    return NULL;
+  }
+
+  /* Unlink the temp file so it will be deleted when closed */
+  if (0 != unlink(name)) {
+    fprintf(stderr, "Couldn't unlink %s : %s\n", name, strerror(errno));
+    return NULL;
+  }
+  free(name);
+
+  spill->offset = 0;
+  spill->ref_count = 0;
+  spill->is_tmp = 1;
+  return spill;
+}
+
+/*
  * Release a temporary file
  * Decerement the reference count, and if it hits zero close the file.
  *
- * *tmp if the TmpFile to release
+ * *spill is the SpillFile to release
+ * *in is the Input struct (for the current spill file)
  *
  * Returns  0 on success
  *         -1 on failure
  */
 
-int release_tmp(TmpFile *tmp) {
-  if (--tmp->ref_count > 0) return 0;  /* Still in use */
+int release_tmp(SpillFile *spill, Input *in) {
+  if (!spill->is_tmp || --spill->ref_count > 0) return 0;  /* Still in use */
 
-  if (0 != close(tmp->fd)) {
+  if (0 != close(spill->fd)) {
     perror("Closing temporary file");
     return -1;
   }
 
-  free(tmp);
+  if (in->spill == spill) in->spill = NULL;
 
+  free(spill);
+
+  return 0;
+}
+
+/*
+ * Write data to a file descriptor.  Continues until everything has been
+ * written.
+ *
+ * fd is the file descriptor
+ * data is the data to write
+ * len is the number of bytes to write.
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+static int write_all(int fd, unsigned char *data, size_t len) {
+  size_t written = 0;
+  ssize_t bytes;
+
+  while (written < len) {
+    do {
+      bytes = write(fd, data + written, len - written);
+    } while (bytes < 0 && EINTR == errno);
+    if (bytes < 0) return -1;
+    written += bytes;
+  }
+
+  return 0;
+}
+
+/*
+ * Read data from a file descriptor.  Continues until everything asked for
+ * has been read, or it hits end of file.
+ *
+ * fd     is the file descriptor
+ * data   is the buffer to put the data in
+ * len    is the number of bytes to read
+ * offset is the offset into fd to start reading from
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+
+static int pread_all(int fd, unsigned char *data, size_t len, off_t offset) {
+  size_t got = 0;
+  ssize_t bytes = 0;
+  
+  while (got < len) {
+    do {
+      bytes = pread(fd, data + got, len - got, offset + got);
+    } while (bytes < 0 && EINTR == errno);
+    if (bytes < 0) {
+      abort();
+      perror("Reading temporary file");
+      return -1;
+    }
+    if (bytes == 0) {
+      fprintf(stderr, "Unexpected end of file reading temporary file\n");
+      return -1;
+    }
+    got += bytes;
+  }
+
+  return 0;
+}
+
+/* Spill data to a temporary file (or just forget it if the input is a
+ * regular file).
+ *
+ * *options is the Opts struct with the temporary directory
+ * *chunks is the list of chunks to search for a candidate to spill
+ * *in is the Input struct
+ * *alloced is the amount of memory used to store data
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+static int spill_data(Opts *options, ChunkList *chunks,
+		      Input *in, size_t *alloced) {
+  SpillFile *spill;
+  Chunk *candidate;
+
+  /* Look for a chunk that can be spilled */
+  candidate = NULL != chunks->spilled ? chunks->spilled : chunks->head;
+
+  while (NULL != candidate
+	 && (candidate->nwriters > 0 || NULL == candidate->data)) {
+    candidate = candidate->next;
+  }
+  if (NULL == candidate) return 0;  /* Nothing suitable */
+
+  if (NULL != in->spill && !in->spill->is_tmp) {
+    /* Input is regular, just need to forget the data read earlier */
+    free(candidate->data);
+    candidate->data = NULL;
+    (*alloced) -= CHUNK_SZ;
+    return 0;
+  }
+
+  /* Otherwise have to store it somewhere */
+  if (NULL == in->spill || in->spill->offset >= options->file_max) {
+    spill = make_tmp_file(options, in->spill);
+    if (NULL == spill) return -1;
+  } else {
+    spill = in->spill;
+  }
+
+  if (0 != write_all(spill->fd, candidate->data, candidate->len)) {
+    perror("Writing to temporary file");
+    return -1;
+  }
+
+  candidate->spill = spill;
+  candidate->spill_offset = spill->offset;
+  spill->offset += candidate->len;
+  spill->ref_count++;
+
+  free(candidate->data);
+  candidate->data = NULL;
+  (*alloced) -= CHUNK_SZ;
+
+  in->spill = spill;
+  chunks->spilled = candidate;
+
+  return 0;
+}
+
+/*
+ * Reread spilled data.
+ *
+ * *chunk is the Chunk struct that got spilled
+ * *alloced is the amount of data space allocated
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+static int reread_data(Chunk *chunk, size_t *alloced) {
+  assert(chunk->len > 0 && chunk->len <= CHUNK_SZ);
+  chunk->data = malloc(chunk->len);
+  if (NULL == chunk->data) {
+    perror("reread_data");
+    return -1;
+  }
+  if (0 != pread_all(chunk->spill->fd,
+		     chunk->data, chunk->len, chunk->spill_offset)) {
+    return -1;
+  }
+  (*alloced) += CHUNK_SZ;
   return 0;
 }
 
@@ -261,8 +485,8 @@ int release_tmp(TmpFile *tmp) {
  * Allocate a new Chunk, and update the linked list and tail pointers to
  * point to it.
  *
- * **tail_p is the location of the pointer to the existing tail end of the list.
- * nrefs is the initial reference count
+ * *chunks is the ChunkList struct with the pointer to the list tail
+ * nrefs   is the initial reference count for the new chunk
  *
  * Returns  0 on success
  *         -1 on failure
@@ -284,14 +508,82 @@ static int new_chunk(ChunkList *chunks, int nrefs) {
   return 0;
 }
 
+/*
+ * Decerement the reference count for a chunk, and free it if it gets to
+ * zero.
+ *
+ * *chunks  is the ChunkList struct, so we can update head and spilled.
+ * *chunk   is the chunk to free
+ * *options is the Opts struct, for the maximum memory limit
+ * *in      is the Input struct (for the current spill file)
+ * *alloced is the total amount of space allocated for data
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+static int release_chunk(ChunkList *chunks, Chunk *chunk,
+			 Opts *options, Input *in, size_t *alloced) {
+  if (--chunk->ref_count > 0) {
+    if (*alloced >= options->max
+	&& chunk->nwriters == 0
+	&& NULL != chunk->spill
+	&& NULL != chunk->data) {
+      /* Re-spill data if still under memory pressure */
+      free(chunk->data);
+      chunk->data = NULL;
+      (*alloced) -= CHUNK_SZ;
+    }
+    return 0;
+  }
+
+  /* No more readers for the chunk, so free it */
+  assert(chunk == chunks->head); /* Should be head of list */
+  chunks->head = chunk->next;
+  if (chunk == chunks->spilled) chunks->spilled = NULL;
+  if (NULL != chunk->spill) {
+    if (0 != release_tmp(chunk->spill, in)) return -1;
+  }
+  if (NULL != chunk->data) {
+    free(chunk->data);
+    (*alloced) -= CHUNK_SZ;
+  }
+  free(chunk);
+
+  return 0;
+}
+
+/*
+ * Release all chunks from a starting point.  This is used when closing files
+ * so any chunks that are no longer needed get removed.
+ *
+ * *chunks  is the ChunkList struct, so we can update head and spilled.
+ * *chunk   is the starting chunk
+ * *options is the Opts struct, for the maximum memory limit
+ * *in      is the Input struct (for the current spill file)
+ * *alloced is the total amount of space allocated for data
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+static int release_chunks(ChunkList *chunks, Chunk *chunk,
+			  Opts *options, Input *in, size_t *alloced) {
+  for (;NULL != chunk; chunk = chunk->next) {
+    if (0 != release_chunk(chunks, chunk, options, in, alloced)) return -1;
+  }
+  return 0;
+}
+
 /* 
  * Read some data into the tail Chunk.  If it's full, make a new chunk
  * first and read into that.  If the end of the input file is read,
  * *read_eof is set to true.
  *
- * *in_name  is the name of the input file
- * in_fd     is the descriptor to read
- * **tail_p  is the current tail Chunk
+ * *options  is the Opts struct
+ * *in       is the Input struct for the input file
+ * *alloced  is the total memory allocated for storing data
+ * *chunks   is the ChunkList struct with the list head and tail pointers
  * *read_eof is the end-of-file flag
  * nrefs     is the reference count to set on new Chunks.
  *
@@ -306,16 +598,27 @@ static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
   if (chunks->tail->len == CHUNK_SZ) {
     /* Need to start a new Chunk */
     if (0 != new_chunk(chunks, nrefs)) return -1;
+
+    if (NULL != in->spill && !in->spill->is_tmp) {
+      /* Set starting offset for spillage purposes */
+      chunks->tail->spill_offset = in->pos;
+      chunks->tail->spill = in->spill;
+    }
   }
 
   if (NULL == chunks->tail->data) {
+
+    if (*alloced >= options->max) {
+      if (0 != spill_data(options, chunks, in, alloced)) return -1;
+    }
+
     /* Allocate a buffer to put the data in */
     chunks->tail->data = malloc(CHUNK_SZ);
     if (NULL == chunks->tail->data) {
       perror("do_read");
       return -1;
     }
-    *alloced += CHUNK_SZ;
+    (*alloced) += CHUNK_SZ;
   }
 
   /* Read some data */ 
@@ -336,7 +639,8 @@ static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
     return 0;
   }
 
-  /* Got some data, update length */
+  /* Got some data, update length and in->pos */
+  in->pos += bytes;
   chunks->tail->len += bytes;
 
   return 0;
@@ -345,8 +649,11 @@ static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
 /*
  * Write some data.
  *
- * *output is the Output struct for the file to write
- * nclosed is the number of files that have been closed so far
+ * *output  is the Output struct for the file to write
+ * *chunks  is the linked list of Chunks
+ * *options is the Opts struct
+ * *in      is the Input struct (for the current spill file)
+ * *alloced is the total space allocated for data
  *
  * Returns the number of bytes written (>= 0) on success
  *         -1 on failure (not EPIPE)
@@ -354,12 +661,14 @@ static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
  */
 
 static ssize_t do_write(Output *output, ChunkList *chunks,
-			size_t *alloced, int nclosed) {
+			Opts *options, Input *in, size_t *alloced) {
   ssize_t bytes = 0;
   Chunk *curr_chunk = output->curr_chunk;
 
   while (curr_chunk->next != NULL || output->offset < curr_chunk->len) {
     /* While there's something to write ... */
+
+    assert(NULL != curr_chunk->data);
 
     if (output->offset < curr_chunk->len) {
       /* Data available in the current Chunk */
@@ -398,32 +707,27 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
       output->offset = 0;
 
       --curr_chunk->nwriters;
-      if (--curr_chunk->ref_count <= nclosed) {
-	/* If no more readers for the current Chunk, free it */
-	assert(curr_chunk == chunks->head); /* Should be head of list */
-	chunks->head = curr_chunk->next;
-	if (curr_chunk == chunks->spilled) chunks->spilled = NULL;
-	if (NULL != curr_chunk->tmp) {
-	  if (0 != release_tmp(curr_chunk->tmp)) return -1;
-	}
-	free(curr_chunk->data);
-	*alloced -= CHUNK_SZ;
-	free(curr_chunk);
+      if (0 != release_chunk(chunks, curr_chunk, options, in, alloced)) {
+	return -1;
       }
 
       curr_chunk = output->curr_chunk;
       curr_chunk->nwriters++;
+
+      if (NULL == curr_chunk->data) {
+	/* Need to re-read spilled data */
+	if (0 != reread_data(curr_chunk, alloced)) return -1;
+      }
     }
   }
   return bytes;
 }
 
 /*
- * Do the copies from in_fd to all the outputs.
+ * Do the copies from input to all the outputs.
  *
- * in_name   is the name of the input file.
- * in_fd     is the file descriptor for the input file.
- * in_reg    is a flag showing if the input is a regular file.
+ * *options  is the Opts struct
+ * *in       is the Input struct for the input file.
  * noutputs  is the number of entries in the outputs array
  * outputs   is the array of Output structs.
  * nregular  is the number of entries in the regular array
@@ -475,7 +779,8 @@ static int do_copy(Opts *options, Input *in,
     if (should_read) {
       if (in->reg) {
 	/* If reading a regular file, do it now */
-	if (0 != do_read(options, in, &alloced, &chunks, &read_eof, noutputs)) {
+	if (0 != do_read(options, in, &alloced, &chunks, &read_eof,
+			 noutputs - nclosed)) {
 	  return -1;
 	}
       } else {
@@ -487,19 +792,27 @@ static int do_copy(Opts *options, Input *in,
       }
     }
 
+    keeping_up = 0;  /* Number of pipes that are keeping up */
+
     /* Add all the pipe outputs that have something to write to the poll list */
     for (i = 0; i < npipes; i++) {
       if (outputs[pipes[i]].curr_chunk != chunks.tail
-	  || outputs[pipes[i]].offset < chunks.tail->len
-	  || read_eof) { /* always after read_eof so we finish */
+	  || outputs[pipes[i]].offset < chunks.tail->len) {
+	/* Something to write */
 	polls[npolls].fd = outputs[pipes[i]].fd;
 	poll_idx[npolls] = i;
 	polls[npolls].events = POLLOUT|POLLERR|POLLHUP;
 	polls[npolls++].revents = 0;
+      } else {
+	/* Keeping up or finished */
+	if (read_eof) {
+	  closing_pipes[pipe_close++] = i;
+	} else {
+	  keeping_up++;
+	}
       }
     }
     
-    keeping_up = 0;  /* Number of pipes that are keeping up */
     if (npolls > 0) {  /* Need to do some polling */
       int ready;
       do {
@@ -517,13 +830,13 @@ static int do_copy(Opts *options, Input *in,
 	  --ready;
 	  if (poll_idx[i] < 0) {  /* Input, try to read from it. */
 	    if (0 != do_read(options, in, &alloced, &chunks,
-			     &read_eof, noutputs)) {
+			     &read_eof, noutputs - nclosed)) {
 	      return -1;
 	    }
 
 	  } else {  /* Output, try to write to it. */
 	    Output *output = &outputs[pipes[poll_idx[i]]];
-	    ssize_t res = do_write(output, &chunks, &alloced, nclosed);
+	    ssize_t res = do_write(output, &chunks, options, in, &alloced);
 
 	    if (-2 == res) { /* Got EPIPE, add to closing_pipes list */
 	      closing_pipes[pipe_close++] = poll_idx[i];
@@ -553,7 +866,7 @@ static int do_copy(Opts *options, Input *in,
 
     for (i = 0; i < nregular; i++) {
       /* Try to write */
-      if (do_write(&outputs[regular[i]], &chunks, &alloced, nclosed) < 0) {
+      if (do_write(&outputs[regular[i]], &chunks, options, in, &alloced) < 0) {
 	return -1;
       }
 
@@ -567,9 +880,10 @@ static int do_copy(Opts *options, Input *in,
 
     /* Close any regular files that have finished */
 
-    for (i = 0; i < reg_close; i++) {
+    for (i = reg_close - 1; i >= 0; i--) {
       int to_close = regular[closing_reg[i]];
 
+      assert(outputs[to_close].fd >= 0);
       if (0 != close(outputs[to_close].fd)) {
 	fprintf(stderr, "Error closing %s : %s\n",
 		outputs[to_close].name, strerror(errno));
@@ -582,15 +896,21 @@ static int do_copy(Opts *options, Input *in,
 	memmove(&regular[closing_reg[i]], &regular[closing_reg[i] + 1],
 		(nregular - closing_reg[i] - 1) * sizeof(regular[0]));
       }
+
+      if (0 != release_chunks(&chunks, outputs[to_close].curr_chunk,
+			      options, in, &alloced)) {
+	return -1;
+      }
       nclosed++;
       nregular--;
     }
 
     /* Close any poll-able files that have finished */
 
-    for (i = 0; i < pipe_close; i++) {
+    for (i = pipe_close - 1; i >= 0; i--) {
       int to_close = pipes[closing_pipes[i]];
 
+      assert(outputs[to_close].fd >= 0);
       if (0 != close(outputs[to_close].fd)) {
 	fprintf(stderr, "Error closing %s : %s\n",
 		outputs[to_close].name, strerror(errno));
@@ -603,12 +923,23 @@ static int do_copy(Opts *options, Input *in,
 	memmove(&pipes[closing_pipes[i]], &pipes[closing_pipes[i] + 1],
 		(npipes - closing_pipes[i] - 1) * sizeof(pipes[0]));
       }
+
+      if (0 != release_chunks(&chunks, outputs[to_close].curr_chunk,
+			      options, in, &alloced)) {
+	return -1;
+      }
       nclosed++;
       npipes--;
     }
-  } while (!read_eof && nclosed < noutputs);
+  } while (nclosed < noutputs);
   return 0;
 }
+
+/*
+ * Show the usage meesage
+ *
+ * prog is the program name
+ */
 
 void show_usage(char *prog) {
   fprintf(stderr, "Usage: %s [-m <limit>] [-f <limit>] [-t temp_dir]\n", prog);
@@ -619,7 +950,7 @@ void show_usage(char *prog) {
  * the letters [TtGgMmKk].  The number is scaled as suggested by the suffix
  * letter.
  *
- * *in is the input string
+ * *in     is the input string
  * *sz_out is the output size in bytes
  *
  * Returns  0 on success
@@ -655,6 +986,17 @@ int parse_size_opt(char *in, size_t *sz_out) {
   }
   return 0;
 }
+
+/* Parse command-line options
+ *
+ * argc        is the option count
+ * argv        is the array of option strings
+ * *options    is the Opts strict to be filled out
+ * *after_opts is the index into argv that follows the option strings
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
 
 int get_options(int argc, char** argv, Opts *options, int *after_opts) {
   int opt;
@@ -698,6 +1040,8 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
     }
   }
 
+  options->tmp_dir_len = strlen(options->tmp_dir);
+
   *after_opts = optind;
   return 0;
 }
@@ -705,7 +1049,7 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
 int main(int argc, char** argv) {
   Opts    options;
   int     out_start = argc;
-  Input   in = { -1, 0, NULL };
+  Input   in = { 0, -1, 0, NULL };
   Output *outputs = malloc((argc - 1) * sizeof(Output));
   int    *regular = malloc((argc - 1) * sizeof(int));
   int    *pipes   = malloc((argc - 1) * sizeof(int));
