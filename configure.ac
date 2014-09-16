@@ -20,14 +20,17 @@ dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.68])
 AC_INIT([teepot], [1.0.0], [])
+AC_CONFIG_AUX_DIR([build-aux])
 AM_INIT_AUTOMAKE([-Wall -Werror foreign])
 AM_MAINTAINER_MODE
 AC_CONFIG_SRCDIR([teepot.c])
 AC_CONFIG_HEADERS([teepot_config.h])
-AC_CONFIG_FILES([Makefile])
+AC_CONFIG_FILES([Makefile tests/Makefile])
+AC_REQUIRE_AUX_FILE([tap-driver.sh])
 
 # Checks for programs.
 AC_PROG_CC
+AC_PROG_AWK
 
 # Checks for libraries.
 

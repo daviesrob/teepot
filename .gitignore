@@ -24,3 +24,17 @@ depcomp
 install-sh
 missing
 stamp-h1
+build-aux/compile
+build-aux/depcomp
+build-aux/install-sh
+build-aux/missing
+
+# tests directory
+tests/Makefile
+tests/Makefile.in
+tests/teepot.log
+tests/teepot.trs
+tests/test-suite.log
+tests/test_tp
+tests/*.o
+tests/*~

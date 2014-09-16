@@ -15,8 +15,13 @@
 # You should have received a copy of the GNU General Public License along with
 # this program. If not, see <http://www.gnu.org/licenses>
 
-SUBDIRS = tests
+TEST_LOG_DRIVER = env AM_TAP_AWK='$(AWK)' $(SHELL) \
+                  $(top_srcdir)/build-aux/tap-driver.sh
 
-bin_PROGRAMS = teepot
+TESTS_ENVIRONMENT = top_builddir=$(top_builddir)
 
-teepot_SOURCES = teepot.c
+TESTS = teepot.test
+
+check_PROGRAMS = test_tp
+
+test_tp_SOURCES = test_tp.c

@@ -1,3 +1,4 @@
+#!/bin/sh
 #
 # Copyright (c) 2014 Genome Research Ltd.
 # Author: Rob Davies <rmd+github@sanger.ac.uk>
@@ -15,8 +16,4 @@
 # You should have received a copy of the GNU General Public License along with
 # this program. If not, see <http://www.gnu.org/licenses>
 
-SUBDIRS = tests
-
-bin_PROGRAMS = teepot
-
-teepot_SOURCES = teepot.c
+"$top_builddir/tests/test_tp" "$top_builddir/teepot"
