@@ -987,6 +987,8 @@ int parse_size_opt(char *in, size_t *sz_out) {
   default:
     return -1;
   }
+
+  *sz_out = sz;
   return 0;
 }
 
@@ -1003,7 +1005,6 @@ int parse_size_opt(char *in, size_t *sz_out) {
 
 int get_options(int argc, char** argv, Opts *options, int *after_opts) {
   int opt;
-  size_t sz;
 
   options->max      = DEFAULT_MAX;
   options->file_max = DEFAULT_FILE_MAX;
@@ -1017,21 +1018,33 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
       options->in_name = optarg;
       break;
 
-    case 'f':
+    case 'f': {
+      size_t sz = 0;
       if (0 != parse_size_opt(optarg, &sz)) {
 	fprintf(stderr, "Couldn't understand file size limit '%s'\n", optarg);
 	return -1;
       }
+      if (0 == sz) {
+	fprintf(stderr, "File size limit should be > 0\n");
+	return -1;
+      }
       options->file_max = sz;
       break;
+    }
 
-    case 'm':
+    case 'm': {
+      size_t sz = 0;
       if (0 != parse_size_opt(optarg, &sz)) {
 	fprintf(stderr, "Couldn't understand memory limit '%s'\n", optarg);
 	return -1;
       }
+      if (0 == sz) {
+	fprintf(stderr, "Memory limit should be > 0\n");
+	return -1;
+      }
       options->max = sz;
       break;
+    }
 
     case 't':
       options->tmp_dir = optarg;
