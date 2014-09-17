@@ -30,11 +30,17 @@
 #include <signal.h>
 #include <assert.h>
 #include <unistd.h>
+#if !defined(HAVE_CLOCK_GETTIME) && defined(HAVE_GETTIMEOFDAY)
+# include <sys/time.h>
+#else
+# include <time.h>
+#endif
 
 /* Options */
 typedef struct {
   size_t      max;      /* Maximum amount of data to keep in memory */
   off_t       file_max; /* Maximum size of each temp file */
+  double      wait_time; /* Time to wait before spilling data */
   const char *tmp_dir;  /* Where to write spilled data */
   const char *in_name;  /* Name of input file */
   size_t      tmp_dir_len; /* strlen(tmp_dir) */
@@ -48,6 +54,14 @@ typedef struct {
 #endif
 #ifndef DEFAULT_TMP_DIR
 #  define DEFAULT_TMP_DIR  "/tmp"
+#endif
+#ifndef DEFAULT_WAIT_TIME
+#  define DEFAULT_WAIT_TIME 1.0
+#endif
+#ifndef MAX_WAIT_TIME
+/* Must be < 2^31 / 1000 to prevent poll timeout from overflowing.
+   Use a nice round number below this, is about 23 days. */
+#  define MAX_WAIT_TIME 2000000.0
 #endif
 
 /* File to spill data to */
@@ -84,19 +98,76 @@ typedef struct {
   off_t    pos;      /* Total bytes read so far */
   int      fd;       /* File descriptor */
   int      reg;      /* Input is a regular file */
-  SpillFile *spill;  /* The current file to spill to */
 } Input;
 
 /* An output */
 
-typedef struct {
-  char  *name;       /* Output file name */
-  int    fd;         /* Output file descriptor */
-  int    is_reg;     /* Output is regular */
-  Chunk *curr_chunk; /* Current Chunk being written */
-  size_t offset;     /* Offset into current Chunk */
+typedef struct Output {
+  char  *name;         /* Output file name */
+  int    fd;           /* Output file descriptor */
+  int    is_reg;       /* Output is regular */
+  Chunk *curr_chunk;   /* Current Chunk being written */
+  size_t offset;       /* Offset into current Chunk */
+  off_t  written;      /* Amount written so far */
+  double write_time;   /* When the last write happened */
+  struct Output *prev; /* Previous output (non-regular only) */
+  struct Output *next; /* Next  output (non-regular only) */
 } Output;
 
+/* Spillage control */
+typedef struct {
+  SpillFile *spill;          /* The current file to spill to */
+  size_t     alloced;        /* Amount of space currently allocated */
+  Output    *pipe_list_head; /* Linked list of non-regular outputs */
+  Output    *pipe_list_tail; /* Linked list of non-regular outputs */
+  Output    *blocking_output; /* Output being waited on if deferring spillage */
+} SpillControl;
+
+/*
+ * Get the time.
+ *
+ * Returns the current time, as a double for easy comparison.
+ *         -1 on failure
+ */
+
+double get_time() {
+#ifdef HAVE_CLOCK_GETTIME
+
+  struct timespec tp = { 0, 0 };
+
+  if (0 != clock_gettime(CLOCK_REALTIME, &tp)) {
+    perror("clock_gettime");
+    return -1.0;
+  }
+
+  return (double) tp.tv_sec + (double) tp.tv_nsec * 1.0E-9;
+
+#else /* HAVE_CLOCK_GETTIME */
+# ifdef HAVE_GETTIMEOFDAY
+
+  struct timeval tv = { 0, 0 };
+  
+  if (0 != gettimeofday(&tv, NULL)) {
+    perror("gettimeofday");
+    return -1.0;
+  }
+
+  return (double) tv.tv_sec + (double) tv.tv_usec * 1.0E-6;
+
+# else /* HAVE_GETTIMEOFDAY */
+
+  time_t t = time(NULL);
+
+  if (t == (time_t) -1) {
+    perror("time");
+    return -1.0;
+  }
+
+  return (double) t;
+
+# endif /* HAVE_GETTIMEOFDAY */
+#endif /* HAVE_CLOCK_GETTIME */
+}
 
 /*
  * Check if a file descriptor points to a regular file, i.e. not poll-able
@@ -148,18 +219,90 @@ static int setnonblock(const char *name, int fd) {
   return 0;
 }
 
+/*
+ * Push an output onto the pipes linked list, for monitoring the slowest output
+ *
+ * output   is the Output to add.
+ * spillage is the SpillControl information
+ */
+
+static void pipe_list_push(Output *output, SpillControl *spillage) {
+  if (NULL != spillage->pipe_list_tail) {
+    spillage->pipe_list_tail->next = output;
+  }
+  output->prev = spillage->pipe_list_tail;
+  output->next = NULL;
+  spillage->pipe_list_tail = output;
+  if (NULL == spillage->pipe_list_head) spillage->pipe_list_head = output;
+}
+
+/*
+ * Remove an output from the pipes linked list
+ *
+ * output   is the Output to remove
+ * spillage is the SpillControl information
+ */
+
+static void pipe_list_remove(Output *output, SpillControl *spillage) {
+  if (NULL == output->prev) {
+    assert(spillage->pipe_list_head == output);
+    spillage->pipe_list_head = output->next;
+  } else {
+    assert(output->prev->next == output);
+    output->prev->next = output->next;
+  }
+  if (NULL == output->next) {
+    assert(spillage->pipe_list_tail == output);
+    spillage->pipe_list_tail = output->prev;
+  } else {
+    assert(output->next->prev == output);
+    output->next->prev = output->prev;
+  }
+}
+
+/*
+ * Insert an output into the pipes linked list.
+ *
+ * output   is the Output to insert
+ * after    is the item that the inserted one should follow.  If NULL
+ *          the inserted item is put at the head of the list.
+ * spillage is the SpillControl information
+ */
+
+static void pipe_list_insert(Output *output, Output *after,
+			     SpillControl *spillage) {
+  if (NULL == after) {
+    output->prev = NULL;
+    output->next = spillage->pipe_list_head;
+    if (NULL != output->next) {
+      output->next->prev = output;
+    } else {
+      spillage->pipe_list_tail = output;
+    }
+    spillage->pipe_list_head = output;
+  } else {
+    output->prev = after;
+    output->next = after->next;
+    if (NULL != output->next) {
+      output->next->prev = output;
+    } else {
+      spillage->pipe_list_tail = output;
+    }
+    after->next = output;
+  }
+}
 
 /*
  * Open the input file and set up the Input struct
  *
  * *options  is the Opt struct with the input file name
  * *in       is the Input struct to fill in
- *
+ * *spillage is the SpillControl information.
  * Returns  0 on success
  *         -1 on failure
  */
 
-int open_input(Opts *options, Input *in) {
+int open_input(Opts *options, Input *in, SpillControl *spillage) {
   if (NULL == options->in_name || 0 == strcmp(options->in_name, "-")) {
     /* Read from stdin */
     options->in_name = "stdin";
@@ -182,18 +325,18 @@ int open_input(Opts *options, Input *in) {
     /* Set input pipes to non-blocking mode */
     if (0 != setnonblock(options->in_name, in->fd)) return -1;
     /* Can't use input for spilling */
-    in->spill = NULL;
+    spillage->spill = NULL;
   } else {
     /* Use input file for spillage */
-    in->spill = malloc(sizeof(SpillFile));
-    if (NULL == in->spill) {
+    spillage->spill = malloc(sizeof(SpillFile));
+    if (NULL == spillage->spill) {
       perror("open_input");
       return -1;
     }
-    in->spill->offset    = 0;
-    in->spill->ref_count = 1;
-    in->spill->fd        = in->fd;
-    in->spill->is_tmp    = 0;
+    spillage->spill->offset    = 0;
+    spillage->spill->ref_count = 1;
+    spillage->spill->fd        = in->fd;
+    spillage->spill->is_tmp    = 0;
   }
 
   in->pos = 0;
@@ -312,14 +455,14 @@ static SpillFile * make_tmp_file(Opts *options, SpillFile *current) {
  * Release a temporary file
  * Decerement the reference count, and if it hits zero close the file.
  *
- * *spill is the SpillFile to release
- * *in is the Input struct (for the current spill file)
+ * *spill    is the SpillFile to release
+ * *spillage is the SpillControl information, for the current spill file
  *
  * Returns  0 on success
  *         -1 on failure
  */
 
-int release_tmp(SpillFile *spill, Input *in) {
+int release_tmp(SpillFile *spill, SpillControl *spillage) {
   if (!spill->is_tmp || --spill->ref_count > 0) return 0;  /* Still in use */
 
   if (0 != close(spill->fd)) {
@@ -327,7 +470,7 @@ int release_tmp(SpillFile *spill, Input *in) {
     return -1;
   }
 
-  if (in->spill == spill) in->spill = NULL;
+  if (spillage->spill == spill) spillage->spill = NULL;
 
   free(spill);
 
@@ -403,14 +546,14 @@ static int pread_all(int fd, unsigned char *data, size_t len, off_t offset) {
  *
  * *options is the Opts struct with the temporary directory
  * *chunks is the list of chunks to search for a candidate to spill
- * *in is the Input struct
- * *alloced is the amount of memory used to store data
+ * *spillage is the SpillControl information
+ *
  * Returns  0 on success
  *         -1 on failure
  */
 
 static int spill_data(Opts *options, ChunkList *chunks,
-		      Input *in, size_t *alloced) {
+		      SpillControl *spillage) {
   SpillFile *spill;
   Chunk *candidate;
 
@@ -423,20 +566,20 @@ static int spill_data(Opts *options, ChunkList *chunks,
   }
   if (NULL == candidate) return 0;  /* Nothing suitable */
 
-  if (NULL != in->spill && !in->spill->is_tmp) {
+  if (NULL != spillage->spill && !spillage->spill->is_tmp) {
     /* Input is regular, just need to forget the data read earlier */
     free(candidate->data);
     candidate->data = NULL;
-    (*alloced) -= CHUNK_SZ;
+    spillage->alloced -= CHUNK_SZ;
     return 0;
   }
 
   /* Otherwise have to store it somewhere */
-  if (NULL == in->spill || in->spill->offset >= options->file_max) {
-    spill = make_tmp_file(options, in->spill);
+  if (NULL == spillage->spill || spillage->spill->offset >= options->file_max) {
+    spill = make_tmp_file(options, spillage->spill);
     if (NULL == spill) return -1;
   } else {
-    spill = in->spill;
+    spill = spillage->spill;
   }
 
   if (0 != write_all(spill->fd, candidate->data, candidate->len)) {
@@ -451,9 +594,9 @@ static int spill_data(Opts *options, ChunkList *chunks,
 
   free(candidate->data);
   candidate->data = NULL;
-  (*alloced) -= CHUNK_SZ;
+  spillage->alloced -= CHUNK_SZ;
 
-  in->spill = spill;
+  spillage->spill = spill;
   chunks->spilled = candidate;
 
   return 0;
@@ -463,13 +606,13 @@ static int spill_data(Opts *options, ChunkList *chunks,
  * Reread spilled data.
  *
  * *chunk is the Chunk struct that got spilled
- * *alloced is the amount of data space allocated
+ * *spillage is the SpillControl information
  *
  * Returns  0 on success
  *         -1 on failure
  */
 
-static int reread_data(Chunk *chunk, size_t *alloced) {
+static int reread_data(Chunk *chunk, SpillControl *spillage) {
   assert(chunk->len > 0 && chunk->len <= CHUNK_SZ);
   chunk->data = malloc(chunk->len);
   if (NULL == chunk->data) {
@@ -480,7 +623,7 @@ static int reread_data(Chunk *chunk, size_t *alloced) {
 		     chunk->data, chunk->len, chunk->spill_offset)) {
     return -1;
   }
-  (*alloced) += CHUNK_SZ;
+  spillage->alloced += CHUNK_SZ;
   return 0;
 }
 
@@ -518,24 +661,23 @@ static int new_chunk(ChunkList *chunks, int nrefs) {
  * *chunks  is the ChunkList struct, so we can update head and spilled.
  * *chunk   is the chunk to free
  * *options is the Opts struct, for the maximum memory limit
- * *in      is the Input struct (for the current spill file)
- * *alloced is the total amount of space allocated for data
+ * *spillage is the SpillControl information
  *
  * Returns  0 on success
  *         -1 on failure
  */
 
 static int release_chunk(ChunkList *chunks, Chunk *chunk,
-			 Opts *options, Input *in, size_t *alloced) {
+			 Opts *options, SpillControl *spillage) {
   if (--chunk->ref_count > 0) {
-    if (*alloced >= options->max
+    if (spillage->alloced >= options->max
 	&& chunk->nwriters == 0
 	&& NULL != chunk->spill
 	&& NULL != chunk->data) {
       /* Re-spill data if still under memory pressure */
       free(chunk->data);
       chunk->data = NULL;
-      (*alloced) -= CHUNK_SZ;
+      spillage->alloced -= CHUNK_SZ;
     }
     return 0;
   }
@@ -545,11 +687,11 @@ static int release_chunk(ChunkList *chunks, Chunk *chunk,
   chunks->head = chunk->next;
   if (chunk == chunks->spilled) chunks->spilled = NULL;
   if (NULL != chunk->spill) {
-    if (0 != release_tmp(chunk->spill, in)) return -1;
+    if (0 != release_tmp(chunk->spill, spillage)) return -1;
   }
   if (NULL != chunk->data) {
     free(chunk->data);
-    (*alloced) -= CHUNK_SZ;
+    spillage->alloced -= CHUNK_SZ;
   }
   free(chunk);
 
@@ -563,17 +705,16 @@ static int release_chunk(ChunkList *chunks, Chunk *chunk,
  * *chunks  is the ChunkList struct, so we can update head and spilled.
  * *chunk   is the starting chunk
  * *options is the Opts struct, for the maximum memory limit
- * *in      is the Input struct (for the current spill file)
- * *alloced is the total amount of space allocated for data
+ * *spillage is the SpillControl information
  *
  * Returns  0 on success
  *         -1 on failure
  */
 
 static int release_chunks(ChunkList *chunks, Chunk *chunk,
-			  Opts *options, Input *in, size_t *alloced) {
+			  Opts *options, SpillControl *spillage) {
   for (;NULL != chunk; chunk = chunk->next) {
-    if (0 != release_chunk(chunks, chunk, options, in, alloced)) return -1;
+    if (0 != release_chunk(chunks, chunk, options, spillage)) return -1;
   }
   return 0;
 }
@@ -585,7 +726,7 @@ static int release_chunks(ChunkList *chunks, Chunk *chunk,
  *
  * *options  is the Opts struct
  * *in       is the Input struct for the input file
- * *alloced  is the total memory allocated for storing data
+ * *spillage is the spillage control struct
  * *chunks   is the ChunkList struct with the list head and tail pointers
  * *read_eof is the end-of-file flag
  * nrefs     is the reference count to set on new Chunks.
@@ -594,25 +735,41 @@ static int release_chunks(ChunkList *chunks, Chunk *chunk,
  *         -1 in failure
  */
 
-static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
+static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
 		       ChunkList *chunks, int *read_eof, int nrefs) {
   ssize_t bytes;
 
-  if (chunks->tail->len == CHUNK_SZ) {
-    /* Need to start a new Chunk */
-    if (0 != new_chunk(chunks, nrefs)) return -1;
+  spillage->blocking_output = NULL;
 
-    if (NULL != in->spill && !in->spill->is_tmp) {
-      /* Set starting offset for spillage purposes */
-      chunks->tail->spill_offset = in->pos;
-      chunks->tail->spill = in->spill;
+  if (chunks->tail->len == CHUNK_SZ || NULL == chunks->tail->data) {
+
+    if (spillage->alloced >= options->max) {
+      if (options->wait_time > 0 && spillage->pipe_list_head != NULL) {
+	double now = get_time();
+	if (now < 0) return -1;
+	if (now < spillage->pipe_list_head->write_time) {
+	  /* Someone fiddled with the clock? */
+	  spillage->pipe_list_head->write_time = now;
+	}
+	if (now - spillage->pipe_list_head->write_time < options->wait_time) {
+	  /* Not waited long enough, so return without reading anything */
+	  spillage->blocking_output = spillage->pipe_list_head;
+	  return 0;
+	}
+      }
+
+      if (0 != spill_data(options, chunks, spillage)) return -1;
     }
-  }
 
-  if (NULL == chunks->tail->data) {
-
-    if (*alloced >= options->max) {
-      if (0 != spill_data(options, chunks, in, alloced)) return -1;
+    if (chunks->tail->len == CHUNK_SZ) {
+      /* Need to start a new Chunk */
+      if (0 != new_chunk(chunks, nrefs)) return -1;
+      
+      if (NULL != spillage->spill && !spillage->spill->is_tmp) {
+	/* Set starting offset for spillage purposes */
+	chunks->tail->spill_offset = in->pos;
+	chunks->tail->spill = spillage->spill;
+      }
     }
 
     /* Allocate a buffer to put the data in */
@@ -621,7 +778,7 @@ static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
       perror("do_read");
       return -1;
     }
-    (*alloced) += CHUNK_SZ;
+    spillage->alloced += CHUNK_SZ;
   }
 
   /* Read some data */ 
@@ -655,8 +812,7 @@ static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
  * *output  is the Output struct for the file to write
  * *chunks  is the linked list of Chunks
  * *options is the Opts struct
- * *in      is the Input struct (for the current spill file)
- * *alloced is the total space allocated for data
+ * *spillage is the SpillControl information
  *
  * Returns the number of bytes written (>= 0) on success
  *         -1 on failure (not EPIPE)
@@ -664,7 +820,7 @@ static ssize_t do_read(Opts *options, Input *in, size_t *alloced,
  */
 
 static ssize_t do_write(Output *output, ChunkList *chunks,
-			Opts *options, Input *in, size_t *alloced) {
+			Opts *options, SpillControl *spillage) {
   ssize_t bytes = 0;
   Chunk *curr_chunk = output->curr_chunk;
 
@@ -694,8 +850,29 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
       if (b == 0) break;  /* Wrote nothing, try again later */
 
       /* Update amount read */
+      output->written += b;
       output->offset += b;
       bytes += b;
+
+      /* Record time and update linked list */
+      if (!output->is_reg) {
+	output->write_time = get_time();
+	if (output->write_time < 0) {
+	  return -1;
+	}
+	
+	while (NULL != output->next
+	       && output->next->written < output->written) {
+	  Output *n = output->next;
+	  assert(n->prev == output);
+	  pipe_list_remove(output, spillage);
+	  pipe_list_insert(output, n, spillage);
+	}
+
+	if (output == spillage->blocking_output) {
+	  spillage->blocking_output = spillage->pipe_list_head;
+	}
+      }
     }
 
     assert(output->offset <= curr_chunk->len);
@@ -710,7 +887,7 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
       output->offset = 0;
 
       --curr_chunk->nwriters;
-      if (0 != release_chunk(chunks, curr_chunk, options, in, alloced)) {
+      if (0 != release_chunk(chunks, curr_chunk, options, spillage)) {
 	return -1;
       }
 
@@ -719,7 +896,7 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
 
       if (NULL == curr_chunk->data) {
 	/* Need to re-read spilled data */
-	if (0 != reread_data(curr_chunk, alloced)) return -1;
+	if (0 != reread_data(curr_chunk, spillage)) return -1;
       }
     }
   }
@@ -737,6 +914,7 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
  * regular   is an array of indexes into outputs of the regular output files
  * npipes    is the number of entries in the pipes array
  * pipes     is an array of indexes into outputs of the poll-able output files
+ * *spillage is the SpillControl information
  *
  * Returns  0 on success
  *         -1 on failure
@@ -745,14 +923,14 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
 static int do_copy(Opts *options, Input *in,
 		   int noutputs, Output *outputs,
 		   int nregular, int *regular,
-		   int npipes, int *pipes) {
+		   int npipes, int *pipes,
+		   SpillControl *spillage) {
   ChunkList chunks = { NULL, NULL, NULL }; /* Linked list of Chunks */ 
   struct pollfd *polls; /* structs for poll(2) */
   int   *poll_idx;    /* indexes in outputs corresponding to entries in polls */
   int   *closing_pipes; /* Pipes that need to be closed */
   int   *closing_reg;   /* Regular files that need to be closed */
   int i, keeping_up = npipes, read_eof = 0, nclosed = 0;
-  size_t alloced = 0;  /* Amount of data storage currently allocated */
 
   chunks.head = chunks.tail = calloc(1, sizeof(Chunk));  /* Initial Chunk */
   polls         = malloc((noutputs + 1) * sizeof(struct pollfd));
@@ -768,21 +946,48 @@ static int do_copy(Opts *options, Input *in,
   chunks.head->ref_count = noutputs;
   chunks.head->nwriters  = noutputs;
 
-  /* Point all outputs to the initial Chunk */
+  /* Point all outputs to the initial Chunk and build linked list of pipes */
   for (i = 0; i < noutputs; i++) {
     outputs[i].curr_chunk = chunks.head;
+    if (!outputs[i].is_reg) pipe_list_push(&outputs[i], spillage);
   }
 
   do {  /* Main loop */
     int npolls = 0, pipe_close = 0, reg_close = 0;
-    /* Only try to read if not at EOF, and either there are no 
-       pipes or at least one pipe has nothing left to write. */
-    int should_read = !read_eof && (npipes == 0 || keeping_up > 0);
+    /* Are we waiting for a slow output? */
+    int blocked = (NULL != spillage->blocking_output
+		   && spillage->alloced >= options->max);
+    int timeout = -1;
+    int should_read;
+
+    if (blocked) {
+      /* Work out how long to wait in poll */
+      double now = get_time();
+      double left;
+      if (now < 0) return -1;
+      if (now < spillage->blocking_output->write_time) {
+	/* Someone fiddled with the clock? */
+	spillage->blocking_output->write_time = now;
+      }
+      left = options->wait_time - (now - spillage->blocking_output->write_time);
+      timeout = left > 0 ? (int)(left * 1000) : 0;
+      if (timeout == 0) { /* Remove the block */
+	blocked = 0;
+	spillage->blocking_output = NULL;
+      }
+    }
+
+    /* Only try to read if not at EOF; either there are no 
+       pipes or at least one pipe has nothing left to write;
+       and we aren't waiting for a slow output in order to prevent spillage */
+    should_read = (!read_eof
+		   && (npipes == 0 || keeping_up > 0)
+		   && !blocked);
 
     if (should_read) {
       if (in->reg) {
 	/* If reading a regular file, do it now */
-	if (0 != do_read(options, in, &alloced, &chunks, &read_eof,
+	if (0 != do_read(options, in, spillage, &chunks, &read_eof,
 			 noutputs - nclosed)) {
 	  return -1;
 	}
@@ -819,7 +1024,7 @@ static int do_copy(Opts *options, Input *in,
     if (npolls > 0) {  /* Need to do some polling */
       int ready;
       do {
-	ready = poll(polls, npolls, -1);
+	ready = poll(polls, npolls, timeout);
       } while (ready < 0 && EINTR == errno);
 
       if (ready < 0) {
@@ -832,14 +1037,14 @@ static int do_copy(Opts *options, Input *in,
 	  
 	  --ready;
 	  if (poll_idx[i] < 0) {  /* Input, try to read from it. */
-	    if (0 != do_read(options, in, &alloced, &chunks,
+	    if (0 != do_read(options, in, spillage, &chunks,
 			     &read_eof, noutputs - nclosed)) {
 	      return -1;
 	    }
 
 	  } else {  /* Output, try to write to it. */
 	    Output *output = &outputs[pipes[poll_idx[i]]];
-	    ssize_t res = do_write(output, &chunks, options, in, &alloced);
+	    ssize_t res = do_write(output, &chunks, options, spillage);
 
 	    if (-2 == res) { /* Got EPIPE, add to closing_pipes list */
 	      closing_pipes[pipe_close++] = poll_idx[i];
@@ -869,7 +1074,7 @@ static int do_copy(Opts *options, Input *in,
 
     for (i = 0; i < nregular; i++) {
       /* Try to write */
-      if (do_write(&outputs[regular[i]], &chunks, options, in, &alloced) < 0) {
+      if (do_write(&outputs[regular[i]], &chunks, options, spillage) < 0) {
 	return -1;
       }
 
@@ -901,7 +1106,7 @@ static int do_copy(Opts *options, Input *in,
       }
 
       if (0 != release_chunks(&chunks, outputs[to_close].curr_chunk,
-			      options, in, &alloced)) {
+			      options, spillage)) {
 	return -1;
       }
       nclosed++;
@@ -927,8 +1132,12 @@ static int do_copy(Opts *options, Input *in,
 		(npipes - closing_pipes[i] - 1) * sizeof(pipes[0]));
       }
 
+      /* Remove from spillage linked list */
+      pipe_list_remove(&outputs[to_close], spillage);
+
+      /* Release any data referenced by this output */
       if (0 != release_chunks(&chunks, outputs[to_close].curr_chunk,
-			      options, in, &alloced)) {
+			      options, spillage)) {
 	return -1;
       }
       nclosed++;
@@ -1006,12 +1215,13 @@ int parse_size_opt(char *in, size_t *sz_out) {
 int get_options(int argc, char** argv, Opts *options, int *after_opts) {
   int opt;
 
-  options->max      = DEFAULT_MAX;
-  options->file_max = DEFAULT_FILE_MAX;
-  options->tmp_dir  = DEFAULT_TMP_DIR;
-  options->in_name  = NULL;
+  options->max       = DEFAULT_MAX;
+  options->file_max  = DEFAULT_FILE_MAX;
+  options->tmp_dir   = DEFAULT_TMP_DIR;
+  options->wait_time = DEFAULT_WAIT_TIME;
+  options->in_name   = NULL;
 
-  while ((opt = getopt(argc, argv, "m:f:t:i:")) != -1) {
+  while ((opt = getopt(argc, argv, "m:f:t:i:w:")) != -1) {
     switch (opt) {
 
     case 'i':
@@ -1050,6 +1260,21 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
       options->tmp_dir = optarg;
       break;
 
+    case 'w': {
+      char *end = NULL;
+      options->wait_time = strtod(optarg, &end);
+      if (end == optarg) {
+	fprintf(stderr,
+		"Couldn't understand wait time (-w) argument '%s'\n", optarg);
+	return -1;
+      }
+      if (options->wait_time > MAX_WAIT_TIME) {
+	fprintf(stderr, "Wait time must be less than %f\n", MAX_WAIT_TIME);
+	return -1;
+      }
+      break;
+    }
+
     default:
       show_usage(argv[0]);
       return -1;
@@ -1065,10 +1290,11 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
 int main(int argc, char** argv) {
   Opts    options;
   int     out_start = argc;
-  Input   in = { 0, -1, 0, NULL };
+  Input   in = { 0, -1, 0 };
   Output *outputs = malloc((argc - 1) * sizeof(Output));
   int    *regular = malloc((argc - 1) * sizeof(int));
   int    *pipes   = malloc((argc - 1) * sizeof(int));
+  SpillControl spillage = { NULL, 0, NULL, NULL, NULL }; /* Spillage info. */
   int     nregular = 0, npipes = 0;
   struct sigaction sig;
 
@@ -1088,7 +1314,7 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  if (0 != open_input(&options, &in)) {
+  if (0 != open_input(&options, &in, &spillage)) {
     return EXIT_FAILURE;
   }
 
@@ -1105,7 +1331,7 @@ int main(int argc, char** argv) {
   
   /* Copy input to all outputs */
   if (do_copy(&options, &in, argc - out_start, outputs,
-	      nregular, regular, npipes, pipes) != 0) {
+	      nregular, regular, npipes, pipes, &spillage) != 0) {
     return EXIT_FAILURE;
   }
 
