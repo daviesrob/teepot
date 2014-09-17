@@ -41,6 +41,8 @@ echo "Missing required header file, giving up."
 exit 1
 ])dnl
 
+AC_CHECK_HEADERS([time.h sys/time.h])
+
 # Check for large file support
 AC_SYS_LARGEFILE
 
@@ -54,5 +56,7 @@ AC_CHECK_FUNCS([memmove strerror strtoul], [], [
 echo "Required function not found, giving up."
 exit 1
 ])dnl
+
+AC_CHECK_FUNCS([gettimeofday])
 
 AC_OUTPUT
