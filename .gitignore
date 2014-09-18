@@ -38,3 +38,7 @@ tests/test-suite.log
 tests/test_tp
 tests/*.o
 tests/*~
+
+# make dist-* output
+teepot-*.tar.*
+teepot-*.zip

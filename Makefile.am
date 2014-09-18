@@ -21,4 +21,4 @@ bin_PROGRAMS = teepot
 
 teepot_SOURCES = teepot.c
 
-man1_MANS = man/man1/teepot.1
+dist_man1_MANS = man/man1/teepot.1

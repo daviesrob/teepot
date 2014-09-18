@@ -20,6 +20,8 @@ TEST_LOG_DRIVER = env AM_TAP_AWK='$(AWK)' $(SHELL) \
 
 TESTS_ENVIRONMENT = top_builddir=$(top_builddir)
 
+EXTRA_DIST = teepot.test
+
 TESTS = teepot.test
 
 check_PROGRAMS = test_tp
