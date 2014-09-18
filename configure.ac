@@ -57,6 +57,8 @@ echo "Required function not found, giving up."
 exit 1
 ])dnl
 
-AC_CHECK_FUNCS([gettimeofday])
+AC_SEARCH_LIBS([clock_gettime], [rt])
+
+AC_CHECK_FUNCS([clock_gettime gettimeofday])
 
 AC_OUTPUT
