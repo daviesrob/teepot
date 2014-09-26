@@ -1015,6 +1015,7 @@ static int do_copy(Opts *options, Input *in,
 	/* Keeping up or finished */
 	if (read_eof) {
 	  closing_pipes[pipe_close++] = i;
+	  timeout = 0; /* Ensure pipe gets closed promptly */
 	} else {
 	  keeping_up++;
 	}
