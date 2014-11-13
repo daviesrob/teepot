@@ -69,7 +69,7 @@ typedef struct SpillFile {
   off_t   offset;     /* Current temp file offset */
   size_t  ref_count;  /* Number of Chunks that reference this file */
   int     fd;         /* File descriptor */
-  int     is_tmp;     /* 1: fd is a temporary file; 0: fd is the input file */ 
+  int     is_tmp;     /* 0: fd is the input file; >0 fd is a temporary file */
 } SpillFile;
 
 /* A chunk of input */
@@ -117,11 +117,20 @@ typedef struct Output {
 /* Spillage control */
 typedef struct {
   SpillFile *spill;          /* The current file to spill to */
-  size_t     alloced;        /* Amount of space currently allocated */
   Output    *pipe_list_head; /* Linked list of non-regular outputs */
   Output    *pipe_list_tail; /* Linked list of non-regular outputs */
   Output    *blocking_output; /* Output being waited on if deferring spillage */
+  off_t      total_spilled;  /* Total bytes spilled (for accounting) */
+  off_t      curr_spilled;   /* Current amount spilled */
+  off_t      max_spilled;    /* Maximum amount spilled */
+  size_t     alloced;        /* Amount of space currently allocated */
+  size_t     max_alloced;    /* Maximum space allocated */
+  int        open_spill_files; /* Count of open spill files */
+  int        max_spill_files;  /* Max number of spill files opened */
+  int        spill_file_count; /* Spill file count */
 } SpillControl;
+
+static unsigned int verbosity = 0; /* How verbose to be. */
 
 /*
  * Get the time.
@@ -167,6 +176,34 @@ double get_time() {
 
 # endif /* HAVE_GETTIMEOFDAY */
 #endif /* HAVE_CLOCK_GETTIME */
+}
+
+/*
+ * Convert a number into a more human-readable form using a suitable SI prefix.
+ *
+ * bytes is the number to convert
+ *
+ * Returns a pointer to a buffer containing the output string.
+ * NB: The buffer is statically allocated.
+ */
+
+static char * human_size(double bytes) {
+  static char buffer[64];
+
+  int multiplier;
+
+  for (multiplier = 0; bytes >= 1000 && multiplier < 8; multiplier++) {
+    bytes /= 1000;
+  }
+
+  if (multiplier > 0) {
+    snprintf(buffer, sizeof(buffer), "%.1f %c",
+	     bytes, " kMGTPEZY"[multiplier]);
+  } else {
+    snprintf(buffer, sizeof(buffer), "%.0f", bytes);
+  }
+
+  return buffer;
 }
 
 /*
@@ -341,6 +378,11 @@ int open_input(Opts *options, Input *in, SpillControl *spillage) {
 
   in->pos = 0;
 
+  if (verbosity > 1) {
+    fprintf(stderr, "%.3f Opened input (%s) on fd %d\n",
+	    get_time(), options->in_name, in->fd);
+  }
+
   return 0;
 }
 
@@ -396,6 +438,11 @@ static int open_outputs(int n, char **names, Output *outputs,
     /* Initialize the pointer to the data to output */
     outputs[i].curr_chunk = NULL;
     outputs[i].offset = 0;
+
+    if (verbosity > 1) {
+      fprintf(stderr, "%.3f Opened output #%d (%s) on fd %d.\n",
+	      get_time(), i, outputs[i].name, outputs[i].fd);
+    }
   }
   return 0;
 }
@@ -471,6 +518,14 @@ int release_tmp(SpillFile *spill, SpillControl *spillage) {
   }
 
   if (spillage->spill == spill) spillage->spill = NULL;
+  spillage->curr_spilled -= spill->offset;
+  spillage->open_spill_files--;
+
+  if (verbosity > 1) {
+    fprintf(stderr,
+	    "%.3f Released spill file #%d; %d spill files now open.\n",
+	    get_time(), spill->is_tmp, spillage->open_spill_files);
+  }
 
   free(spill);
 
@@ -578,6 +633,22 @@ static int spill_data(Opts *options, ChunkList *chunks,
   if (NULL == spillage->spill || spillage->spill->offset >= options->file_max) {
     spill = make_tmp_file(options, spillage->spill);
     if (NULL == spill) return -1;
+
+    spillage->spill_file_count++;
+    if (spillage->spill_file_count > 0) {
+      spill->is_tmp = spillage->spill_file_count;
+    }
+    spillage->open_spill_files++;
+    if (spillage->open_spill_files > spillage->max_spill_files) {
+      spillage->max_spill_files = spillage->open_spill_files;
+    }
+
+    if (verbosity > 1) {
+      fprintf(stderr,
+	      "%.3f Opened spill file #%d on fd %d; %d spill files now open.\n",
+	      get_time(), spillage->spill_file_count, spill->fd,
+	      spillage->open_spill_files);
+    }
   } else {
     spill = spillage->spill;
   }
@@ -585,6 +656,12 @@ static int spill_data(Opts *options, ChunkList *chunks,
   if (0 != write_all(spill->fd, candidate->data, candidate->len)) {
     perror("Writing to temporary file");
     return -1;
+  }
+
+  if (verbosity > 2) {
+    fprintf(stderr, "%.3f Spilled %zd bytes (%sB) to spill file #%d\n",
+	    get_time(), candidate->len, human_size(candidate->len),
+	    spill->is_tmp);
   }
 
   candidate->spill = spill;
@@ -595,6 +672,12 @@ static int spill_data(Opts *options, ChunkList *chunks,
   free(candidate->data);
   candidate->data = NULL;
   spillage->alloced -= CHUNK_SZ;
+
+  spillage->total_spilled += candidate->len;
+  spillage->curr_spilled  += candidate->len;
+  if (spillage->curr_spilled > spillage->max_spilled) {
+    spillage->max_spilled = spillage->curr_spilled;
+  }
 
   spillage->spill = spill;
   chunks->spilled = candidate;
@@ -624,6 +707,21 @@ static int reread_data(Chunk *chunk, SpillControl *spillage) {
     return -1;
   }
   spillage->alloced += CHUNK_SZ;
+  if (spillage->alloced > spillage->max_alloced) {
+    spillage->max_alloced = spillage->alloced;
+  }
+
+  if (verbosity > 2) {
+    if (chunk->spill->is_tmp) {
+      fprintf(stderr, "%.3f Re-read %zd bytes (%sB) from spill file #%d\n",
+	      get_time(), chunk->len, human_size(chunk->len),
+	      chunk->spill->is_tmp);
+    } else {
+      fprintf(stderr, "%.3f Re-read %zd bytes (%sB) from input file\n",
+	      get_time(), chunk->len, human_size(chunk->len));
+    }
+  } 
+
   return 0;
 }
 
@@ -779,6 +877,9 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
       return -1;
     }
     spillage->alloced += CHUNK_SZ;
+    if (spillage->alloced > spillage->max_alloced) {
+      spillage->max_alloced = spillage->alloced;
+    }
   }
 
   /* Read some data */ 
@@ -796,12 +897,20 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
 
   if (bytes == 0) { /* EOF */
     *read_eof = 1;
+    if (verbosity > 2) {
+      fprintf(stderr, "%.3f Got EOF on input\n", get_time());
+    }
     return 0;
   }
 
   /* Got some data, update length and in->pos */
   in->pos += bytes;
   chunks->tail->len += bytes;
+
+  if (verbosity > 2) {
+    fprintf(stderr, "%.3f Read %zd bytes from input; %lld (%sB) so far.\n",
+	    get_time(), bytes, (long long) in->pos, human_size(in->pos));
+  }
 
   return 0;
 }
@@ -813,6 +922,7 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
  * *chunks  is the linked list of Chunks
  * *options is the Opts struct
  * *spillage is the SpillControl information
+ * index    is the index of the output in the outputs array
  *
  * Returns the number of bytes written (>= 0) on success
  *         -1 on failure (not EPIPE)
@@ -820,7 +930,7 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
  */
 
 static ssize_t do_write(Output *output, ChunkList *chunks,
-			Opts *options, SpillControl *spillage) {
+			Opts *options, SpillControl *spillage, int index) {
   ssize_t bytes = 0;
   Chunk *curr_chunk = output->curr_chunk;
 
@@ -900,6 +1010,14 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
       }
     }
   }
+
+  if (verbosity > 2 && bytes > 0) {
+    fprintf(stderr,
+	    "%.3f Wrote %zd bytes to output #%d (%s); %lld (%sB) so far.\n",
+	    get_time(), bytes, index, output->name,
+	    (long long) output->written, human_size(output->written));
+  }
+
   return bytes;
 }
 
@@ -1045,7 +1163,8 @@ static int do_copy(Opts *options, Input *in,
 
 	  } else {  /* Output, try to write to it. */
 	    Output *output = &outputs[pipes[poll_idx[i]]];
-	    ssize_t res = do_write(output, &chunks, options, spillage);
+	    ssize_t res = do_write(output, &chunks, options,
+				   spillage, pipes[poll_idx[i]]);
 
 	    if (-2 == res) { /* Got EPIPE, add to closing_pipes list */
 	      closing_pipes[pipe_close++] = poll_idx[i];
@@ -1075,7 +1194,8 @@ static int do_copy(Opts *options, Input *in,
 
     for (i = 0; i < nregular; i++) {
       /* Try to write */
-      if (do_write(&outputs[regular[i]], &chunks, options, spillage) < 0) {
+      if (do_write(&outputs[regular[i]], &chunks,
+		   options, spillage, regular[i]) < 0) {
 	return -1;
       }
 
@@ -1097,6 +1217,10 @@ static int do_copy(Opts *options, Input *in,
 	fprintf(stderr, "Error closing %s : %s\n",
 		outputs[to_close].name, strerror(errno));
 	return -1;
+      }
+      if (verbosity > 1) {
+	fprintf(stderr, "%.3f Closed output #%d (%s)\n",
+		get_time(), to_close, outputs[to_close].name);
       }
       outputs[to_close].fd = -1;
 
@@ -1125,6 +1249,10 @@ static int do_copy(Opts *options, Input *in,
 		outputs[to_close].name, strerror(errno));
 	return -1;
       }
+      if (verbosity > 1) {
+	fprintf(stderr, "%.3f Closed output #%d (%s)\n",
+		get_time(), to_close, outputs[to_close].name);
+      }
       outputs[to_close].fd = -1;
 
       /* Remove the entry from the pipes array */
@@ -1145,6 +1273,36 @@ static int do_copy(Opts *options, Input *in,
       npipes--;
     }
   } while (nclosed < noutputs);
+
+  if (verbosity > 0) {
+    double now = get_time();
+    fprintf(stderr, "%.3f Read %lld bytes (%sB) from input (%s)\n",
+	    now, (long long) in->pos, human_size(in->pos), options->in_name);
+    for (i = 0; i < noutputs; i++) {
+      fprintf(stderr, "%.3f Wrote %lld bytes (%sB) to output #%d (%s)\n",
+	      now, (long long) outputs[i].written,
+	      human_size(outputs[i].written),
+	      i, outputs[i].name);
+    }
+    fprintf(stderr, "%.3f Maximum buffer used = %zd bytes (%sB)\n",
+	    now, spillage->max_alloced, human_size(spillage->max_alloced));
+    if (!in->reg) {
+      fprintf(stderr, "%.3f Spilled %lld bytes (%sB) to temporary files\n",
+	      now, (long long) spillage->total_spilled,
+	      human_size(spillage->total_spilled));
+      if (spillage->total_spilled > 0) {
+	fprintf(stderr, "%.3f Maximum spilled at one time = %lld bytes (%sB)\n",
+		now, (long long) spillage->max_spilled,
+		human_size(spillage->max_spilled));
+	fprintf(stderr, "%.3f Total temporary files opened = %d\n",
+		now, spillage->spill_file_count);
+	fprintf(stderr,
+		"%.3f Maximum temporary files in use at one time = %d\n",
+		now, spillage->max_spill_files);
+      }
+    }
+  }
+
   return 0;
 }
 
@@ -1222,7 +1380,7 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
   options->wait_time = DEFAULT_WAIT_TIME;
   options->in_name   = NULL;
 
-  while ((opt = getopt(argc, argv, "m:f:t:i:w:")) != -1) {
+  while ((opt = getopt(argc, argv, "m:f:t:i:vw:")) != -1) {
     switch (opt) {
 
     case 'i':
@@ -1261,6 +1419,10 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
       options->tmp_dir = optarg;
       break;
 
+    case 'v':
+      verbosity++;
+      break;
+
     case 'w': {
       char *end = NULL;
       options->wait_time = strtod(optarg, &end);
@@ -1295,7 +1457,8 @@ int main(int argc, char** argv) {
   Output *outputs = malloc((argc - 1) * sizeof(Output));
   int    *regular = malloc((argc - 1) * sizeof(int));
   int    *pipes   = malloc((argc - 1) * sizeof(int));
-  SpillControl spillage = { NULL, 0, NULL, NULL, NULL }; /* Spillage info. */
+  SpillControl spillage = { NULL, NULL, NULL, NULL,
+			    0, 0, 0, 0, 0, 0, 0, 0 };  /* Spillage info. */
   int     nregular = 0, npipes = 0;
   struct sigaction sig;
 
@@ -1313,6 +1476,10 @@ int main(int argc, char** argv) {
 
   if (0 != get_options(argc, argv, &options, &out_start)) {
     return EXIT_FAILURE;
+  }
+
+  if (verbosity > 0) {
+    fprintf(stderr, "%.3f Started.\n", get_time());
   }
 
   if (0 != open_input(&options, &in, &spillage)) {
@@ -1334,6 +1501,10 @@ int main(int argc, char** argv) {
   if (do_copy(&options, &in, argc - out_start, outputs,
 	      nregular, regular, npipes, pipes, &spillage) != 0) {
     return EXIT_FAILURE;
+  }
+
+  if (verbosity > 0) {
+    fprintf(stderr, "%.3f Finished.\n", get_time());
   }
 
   return EXIT_SUCCESS;

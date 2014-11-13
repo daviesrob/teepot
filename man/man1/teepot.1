@@ -45,6 +45,16 @@ enough free space to store all of the data that may be spilled (in the
 worst case, this may be the full size of the input data).
 
 .TP
+\fB-v\fP
+Increases verbosity.  One \fB-v\fP will make \fBteepot\fP print a line
+when it starts, and a summary of what it has done at the end.  The summary
+includes the amount of data read from the input and delivered to each output
+along with information about how much buffer was used and how much data was
+spilled (if any).  Two will make it log when files are opened and closed.
+Three will make it log file reads and writes.  All logging output goes to
+\fBstderr\fP.
+
+.TP
 \fB-w\fP \fIseconds\fP
 Sets the time to wait for the slowest output to \fIseconds\fP.  If the buffer
 is full and nothing has been written to the slowest output for the given
