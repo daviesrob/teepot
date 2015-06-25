@@ -1022,6 +1022,35 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
 }
 
 /*
+ * Remove entries corresponding to closed files from an index array.
+ * The input array will be either the pipes or regular array.  Any entries
+ * with the value -1 correspond to closed files and need to be removed.
+ * This walks along the array, shuffling items down where necessary to
+ * remove ones with negative values.
+ *
+ * *index is the input array.
+ * nitems is the original number of items in the array.
+ *
+ * Returns the number of items left after any removals.
+ */
+
+int cull_index_array(int *index, int nitems) {
+  int i, j;
+
+  /* Shuffle down if necessary */
+  for (i = 0, j = 0; i < nitems; i++) {
+    if (index[i] < 0) continue;
+    if (j < i) index[j] = index[i];
+    j++;
+  }
+
+  /* Wipe out any stale data after the new array end */
+  for (i = j; i < nitems; i++) index[i] = -1;
+
+  return j; /* New length */
+}
+
+/*
  * Do the copies from input to all the outputs.
  *
  * *options  is the Opts struct
@@ -1209,10 +1238,16 @@ static int do_copy(Opts *options, Input *in,
 
     /* Close any regular files that have finished */
 
-    for (i = reg_close - 1; i >= 0; i--) {
-      int to_close = regular[closing_reg[i]];
+    for (i = 0; i < reg_close; i++) {
+      int reg_idx = closing_reg[i];
+      int to_close;
 
+      assert(reg_idx >= 0 && reg_idx < nregular);
+
+      to_close = regular[reg_idx];
+      assert(to_close >= 0 && to_close < noutputs);
       assert(outputs[to_close].fd >= 0);
+
       if (0 != close(outputs[to_close].fd)) {
 	fprintf(stderr, "Error closing %s : %s\n",
 		outputs[to_close].name, strerror(errno));
@@ -1223,27 +1258,30 @@ static int do_copy(Opts *options, Input *in,
 		get_time(), to_close, outputs[to_close].name);
       }
       outputs[to_close].fd = -1;
-
-      /* Remove the entry from the regular array */
-      if (closing_reg[i] < nregular - 1) {
-	memmove(&regular[closing_reg[i]], &regular[closing_reg[i] + 1],
-		(nregular - closing_reg[i] - 1) * sizeof(regular[0]));
-      }
+      regular[reg_idx] = -1; /* Mark for removal */
 
       if (0 != release_chunks(&chunks, outputs[to_close].curr_chunk,
 			      options, spillage)) {
 	return -1;
       }
       nclosed++;
-      nregular--;
     }
+
+    /* Remove entries for closed outputs from the regular array */
+    if (reg_close) nregular = cull_index_array(regular, nregular);
 
     /* Close any poll-able files that have finished */
 
-    for (i = pipe_close - 1; i >= 0; i--) {
-      int to_close = pipes[closing_pipes[i]];
+    for (i = 0; i < pipe_close; i++) {
+      int pipe_idx = closing_pipes[i];
+      int to_close;
 
+      assert(pipe_idx >= 0 && pipe_idx < npipes);
+
+      to_close = pipes[closing_pipes[i]];
+      assert(to_close >= 0 && to_close < noutputs);
       assert(outputs[to_close].fd >= 0);
+
       if (0 != close(outputs[to_close].fd)) {
 	fprintf(stderr, "Error closing %s : %s\n",
 		outputs[to_close].name, strerror(errno));
@@ -1254,12 +1292,7 @@ static int do_copy(Opts *options, Input *in,
 		get_time(), to_close, outputs[to_close].name);
       }
       outputs[to_close].fd = -1;
-
-      /* Remove the entry from the pipes array */
-      if (closing_pipes[i] < npipes - 1) {
-	memmove(&pipes[closing_pipes[i]], &pipes[closing_pipes[i] + 1],
-		(npipes - closing_pipes[i] - 1) * sizeof(pipes[0]));
-      }
+      pipes[pipe_idx] = -1; /* Mark for removal */
 
       /* Remove from spillage linked list */
       pipe_list_remove(&outputs[to_close], spillage);
@@ -1270,8 +1303,11 @@ static int do_copy(Opts *options, Input *in,
 	return -1;
       }
       nclosed++;
-      npipes--;
     }
+
+    /* Remove entries for closed outputs from the pipes array */
+    if (pipe_close) npipes = cull_index_array(pipes, npipes);
+
   } while (nclosed < noutputs);
 
   if (verbosity > 0) {
