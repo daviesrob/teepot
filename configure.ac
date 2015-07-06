@@ -19,7 +19,7 @@ this program. If not, see <http://www.gnu.org/licenses>])
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.68])
-AC_INIT([teepot], [1.1.0], [])
+AC_INIT([teepot], [1.1.1], [])
 AC_CONFIG_AUX_DIR([build-aux])
 AM_INIT_AUTOMAKE([-Wall -Werror foreign])
 AM_MAINTAINER_MODE
