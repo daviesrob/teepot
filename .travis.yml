@@ -2,6 +2,8 @@ sudo: false
 
 language: c
 
-compiler: gcc
+compiler:
+  - gcc
+  - clang
 
 script: autoreconf -if && ./configure && make && make check
