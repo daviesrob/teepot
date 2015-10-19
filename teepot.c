@@ -338,7 +338,6 @@ static void pipe_list_insert(Output *output, Output *after,
  * Returns  0 on success
  *         -1 on failure
  */
-
 int open_input(Opts *options, Input *in, SpillControl *spillage) {
   if (NULL == options->in_name || 0 == strcmp(options->in_name, "-")) {
     /* Read from stdin */
@@ -1158,6 +1157,14 @@ static int do_copy(Opts *options, Input *in,
 	poll_idx[npolls] = i;
 	polls[npolls].events = POLLOUT|POLLERR|POLLHUP;
 	polls[npolls++].revents = 0;
+
+	if (outputs[pipes[i]].curr_chunk == chunks.tail
+	    || outputs[pipes[i]].curr_chunk->next == chunks.tail) {
+	  /* Encourage more reading if near to the end of the stored data.
+	     This should allow a small buffer to build up, which can
+	     help to avoid stalls in pipelines */
+	  keeping_up++;
+	}
       } else {
 	/* Keeping up or finished */
 	if (read_eof) {
@@ -1213,6 +1220,13 @@ static int do_copy(Opts *options, Input *in,
 		   encourage more reading */
 		keeping_up++;
 	      }
+	    } else if (!read_eof
+		       && (output->curr_chunk == chunks.tail
+			   || output->curr_chunk->next == chunks.tail)) {
+	      /* Encourage more reading if near to the end of the stored data.
+		 This should allow a small buffer to build up, which can
+		 help to avoid stalls in pipelines */
+	      keeping_up++;
 	    }
 	  }
 	}
