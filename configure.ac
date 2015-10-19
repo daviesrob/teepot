@@ -32,6 +32,17 @@ AC_REQUIRE_AUX_FILE([tap-driver.sh])
 AC_PROG_CC
 AC_PROG_AWK
 
+# Check for pthreads
+AC_SUBST([HAVE_PTHREADS])
+AC_ARG_ENABLE([pthreads],
+	[AS_HELP_STRING([--disable-pthreads], [disable pthreads])],
+	[], [enable_pthreads=check])
+
+AS_IF([test "x$enable_pthreads" != "xno"],
+      [AX_PTHREAD([AC_DEFINE([HAVE_PTHREADS], [1],
+                             [Define if pthreads is available])],
+	          [AC_MSG_WARN([pthreads not found, threading disabled])])])
+
 # Checks for libraries.
 
 # Checks for header files.

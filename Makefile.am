@@ -17,6 +17,8 @@
 
 SUBDIRS = tests
 
+ACLOCAL_AMFLAGS = -I m4
+
 bin_PROGRAMS = teepot
 
 teepot_SOURCES = teepot.c
