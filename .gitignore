@@ -28,6 +28,8 @@ build-aux/compile
 build-aux/depcomp
 build-aux/install-sh
 build-aux/missing
+build-aux/config.guess
+build-aux/config.sub
 
 # tests directory
 tests/Makefile
