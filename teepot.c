@@ -30,10 +30,14 @@
 #include <signal.h>
 #include <assert.h>
 #include <unistd.h>
+#include <math.h>
 #if !defined(HAVE_CLOCK_GETTIME) && defined(HAVE_GETTIMEOFDAY)
 # include <sys/time.h>
 #else
 # include <time.h>
+#endif
+#ifdef HAVE_PTHREADS
+# include <pthread.h>
 #endif
 
 /* Options */
@@ -44,6 +48,7 @@ typedef struct {
   const char *tmp_dir;  /* Where to write spilled data */
   const char *in_name;  /* Name of input file */
   size_t      tmp_dir_len; /* strlen(tmp_dir) */
+  int         use_threads; /* Use threads for outputs */
 } Opts;
 
 #ifndef DEFAULT_MAX
@@ -82,16 +87,13 @@ typedef struct Chunk {
   off_t          spill_offset;  /* Offset into spill file */
   SpillFile     *spill;         /* Spill file */
   struct Chunk  *next;          /* Next Chunk in the list */
+#ifdef HAVE_PTHREADS
+  pthread_mutex_t lock;
+#endif
 } Chunk;
 
 /* Chunk size to use */
 #define CHUNK_SZ (1024*1024)
-
-typedef struct ChunkList {
-  Chunk *head;    /* List head */
-  Chunk *spilled; /* Last chunk to be spilled to a file */
-  Chunk *tail;    /* List tail */
-} ChunkList;
 
 /* The input */
 typedef struct {
@@ -112,7 +114,27 @@ typedef struct Output {
   double write_time;   /* When the last write happened */
   struct Output *prev; /* Previous output (non-regular only) */
   struct Output *next; /* Next  output (non-regular only) */
+#ifdef HAVE_PTHREADS
+  pthread_t thread;    /* Thread ID for this output */
+  int       res;       /* Thread return code, negative = error, positive = ok */
+#endif
 } Output;
+
+static Output any_output;
+#define ANY_OUTPUT &any_output
+
+typedef struct ChunkList {
+  Chunk *head;    /* List head */
+  Chunk *spilled; /* Last chunk to be spilled to a file */
+  Chunk *tail;    /* List tail */
+  int    read_eof; /* Reading finished (threaded mode only) */
+  Output *closed;  /* Closed outputs (threaded mode only) */
+  size_t read_count;
+#ifdef HAVE_PTHREADS
+  pthread_mutex_t lock;
+  pthread_cond_t  new_data;
+#endif
+} ChunkList;
 
 /* Spillage control */
 typedef struct {
@@ -120,6 +142,8 @@ typedef struct {
   Output    *pipe_list_head; /* Linked list of non-regular outputs */
   Output    *pipe_list_tail; /* Linked list of non-regular outputs */
   Output    *blocking_output; /* Output being waited on if deferring spillage */
+  off_t      max_pipe;       /* Most data written to a pipe */
+  off_t      max_all;        /* Most data written to anything */
   off_t      total_spilled;  /* Total bytes spilled (for accounting) */
   off_t      curr_spilled;   /* Current amount spilled */
   off_t      max_spilled;    /* Maximum amount spilled */
@@ -128,7 +152,45 @@ typedef struct {
   int        open_spill_files; /* Count of open spill files */
   int        max_spill_files;  /* Max number of spill files opened */
   int        spill_file_count; /* Spill file count */
+  int        npipes;           /* Number of pipes still open */
+#ifdef HAVE_PTHREADS
+  pthread_mutex_t lock;
+  pthread_cond_t  data_written;
+#endif
 } SpillControl;
+
+#ifdef HAVE_PTHREADS
+typedef struct {
+  Opts         *options;
+  Output       *output;
+  SpillControl *spillage;
+  ChunkList    *chunks;
+  int           index;
+} ThreadParams;
+
+#define LOCK_MUTEX(M) do {						\
+    if (pthread_mutex_lock(M) != 0) abort();				\
+  } while (0)
+
+#define UNLOCK_MUTEX(M) do {			\
+    if (pthread_mutex_unlock(M)) abort();	\
+  } while (0)
+
+#define DESTROY_MUTEX(M) do {						\
+    int dm_res = pthread_mutex_destroy(M);				\
+    if (dm_res != 0) {							\
+      fprintf(stderr, "Failed to destroy mutex: %s\n", strerror(errno)); \
+      abort();								\
+    }									\
+  } while (0)
+
+#else
+
+#define LOCK_MUTEX(M) do { } while (0)
+#define UNLOCK_MUTEX(M) do { } while (0)
+#define DESTROY_MUTEX(M) do { } while (0)
+
+#endif
 
 static unsigned int verbosity = 0; /* How verbose to be. */
 
@@ -176,6 +238,15 @@ double get_time() {
 
 # endif /* HAVE_GETTIMEOFDAY */
 #endif /* HAVE_CLOCK_GETTIME */
+}
+
+static inline void calc_timeout(struct timespec *timeout,
+				double now, double wait_time) {
+  double t, f;
+  t = now + wait_time;
+  f = floor(t);
+  timeout->tv_sec  = (time_t) f;
+  timeout->tv_nsec = (t - f) * 1e9;
 }
 
 /*
@@ -250,6 +321,33 @@ static int setnonblock(const char *name, int fd) {
   
   if (fcntl(fd, F_SETFL, val | O_NONBLOCK)) {
     fprintf(stderr, "Couldn't set %s to non-blocking mode : %s",
+	    name, strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+/*
+ * Set a file descriptor to blocking mode
+ *
+ * *name is the name of the file (for error reporting)
+ * fd    is the descriptor
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
+static int unsetnonblock(const char *name, int fd) {
+  int val;
+
+  if ((val = fcntl(fd, F_GETFL)) == -1) {
+    fprintf(stderr, "Couldn't get file descriptor flags for %s : %s",
+	    name, strerror(errno));
+    return -1;
+  }
+  
+  if (fcntl(fd, F_SETFL, val & ~O_NONBLOCK)) {
+    fprintf(stderr, "Couldn't set %s to blocking mode : %s",
 	    name, strerror(errno));
     return -1;
   }
@@ -358,8 +456,13 @@ int open_input(Opts *options, Input *in, SpillControl *spillage) {
   if (in->reg < 0) return -1;
   
   if (!in->reg) {
-    /* Set input pipes to non-blocking mode */
-    if (0 != setnonblock(options->in_name, in->fd)) return -1;
+    if (options->use_threads) {
+      /* Set input pipes to blocking mode (multi-thread mode only) */
+      if (0 != unsetnonblock(options->in_name, in->fd)) return -1;
+    } else {
+      /* Set input pipes to non-blocking mode (single-thread mode only) */
+      if (0 != setnonblock(options->in_name, in->fd)) return -1;
+    }
     /* Can't use input for spilling */
     spillage->spill = NULL;
   } else {
@@ -509,16 +612,21 @@ static SpillFile * make_tmp_file(Opts *options, SpillFile *current) {
  */
 
 int release_tmp(SpillFile *spill, SpillControl *spillage) {
-  if (!spill->is_tmp || --spill->ref_count > 0) return 0;  /* Still in use */
-
-  if (0 != close(spill->fd)) {
-    perror("Closing temporary file");
-    return -1;
+  LOCK_MUTEX(&spillage->lock);
+  if (!spill->is_tmp || --spill->ref_count > 0) {
+    UNLOCK_MUTEX(&spillage->lock);
+    return 0;  /* Still in use */
   }
 
   if (spillage->spill == spill) spillage->spill = NULL;
   spillage->curr_spilled -= spill->offset;
   spillage->open_spill_files--;
+  UNLOCK_MUTEX(&spillage->lock);
+
+  if (0 != close(spill->fd)) {
+    perror("Closing temporary file");
+    return -1;
+  }
 
   if (verbosity > 1) {
     fprintf(stderr,
@@ -612,19 +720,36 @@ static int spill_data(Opts *options, ChunkList *chunks,
   Chunk *candidate;
 
   /* Look for a chunk that can be spilled */
+  
+  LOCK_MUTEX(&chunks->lock);
   candidate = NULL != chunks->spilled ? chunks->spilled : chunks->head;
 
-  while (NULL != candidate
-	 && (candidate->nwriters > 0 || NULL == candidate->data)) {
-    candidate = candidate->next;
+  while (NULL != candidate) {
+    Chunk *next;
+    LOCK_MUTEX(&candidate->lock);
+    next = candidate->next;
+    if (candidate->nwriters == 0
+	&& candidate->ref_count > 0
+	&& NULL != candidate->data) break;
+    UNLOCK_MUTEX(&candidate->lock);
+    candidate = next;
   }
+  UNLOCK_MUTEX(&chunks->lock);
   if (NULL == candidate) return 0;  /* Nothing suitable */
+
+  /* candidate will be locked when we get here */
+  LOCK_MUTEX(&spillage->lock);
 
   if (NULL != spillage->spill && !spillage->spill->is_tmp) {
     /* Input is regular, just need to forget the data read earlier */
     free(candidate->data);
     candidate->data = NULL;
     spillage->alloced -= CHUNK_SZ;
+    UNLOCK_MUTEX(&spillage->lock);
+    UNLOCK_MUTEX(&candidate->lock);
+    LOCK_MUTEX(&chunks->lock);
+    chunks->spilled = candidate;
+    UNLOCK_MUTEX(&chunks->lock);
     return 0;
   }
 
@@ -679,7 +804,13 @@ static int spill_data(Opts *options, ChunkList *chunks,
   }
 
   spillage->spill = spill;
+
+  UNLOCK_MUTEX(&spillage->lock);
+  UNLOCK_MUTEX(&candidate->lock);
+
+  LOCK_MUTEX(&chunks->lock);
   chunks->spilled = candidate;
+  UNLOCK_MUTEX(&chunks->lock);
 
   return 0;
 }
@@ -695,22 +826,34 @@ static int spill_data(Opts *options, ChunkList *chunks,
  */
 
 static int reread_data(Chunk *chunk, SpillControl *spillage) {
+  LOCK_MUTEX(&chunk->lock);
+  if (NULL != chunk->data) {
+    UNLOCK_MUTEX(&chunk->lock);
+    return 0;
+  }
   assert(chunk->len > 0 && chunk->len <= CHUNK_SZ);
   chunk->data = malloc(chunk->len);
   if (NULL == chunk->data) {
+    UNLOCK_MUTEX(&chunk->lock);
     perror("reread_data");
     return -1;
   }
   if (0 != pread_all(chunk->spill->fd,
 		     chunk->data, chunk->len, chunk->spill_offset)) {
+    UNLOCK_MUTEX(&chunk->lock);
     return -1;
   }
+  UNLOCK_MUTEX(&chunk->lock);
+
+  LOCK_MUTEX(&spillage->lock);
   spillage->alloced += CHUNK_SZ;
   if (spillage->alloced > spillage->max_alloced) {
     spillage->max_alloced = spillage->alloced;
   }
+  UNLOCK_MUTEX(&spillage->lock);
 
   if (verbosity > 2) {
+    LOCK_MUTEX(&chunk->lock);
     if (chunk->spill->is_tmp) {
       fprintf(stderr, "%.3f Re-read %zd bytes (%sB) from spill file #%d\n",
 	      get_time(), chunk->len, human_size(chunk->len),
@@ -719,6 +862,7 @@ static int reread_data(Chunk *chunk, SpillControl *spillage) {
       fprintf(stderr, "%.3f Re-read %zd bytes (%sB) from input file\n",
 	      get_time(), chunk->len, human_size(chunk->len));
     }
+    UNLOCK_MUTEX(&chunk->lock);
   } 
 
   return 0;
@@ -740,15 +884,44 @@ static int new_chunk(ChunkList *chunks, int nrefs) {
   Chunk *new_tail = calloc(1, sizeof(Chunk));
   if (NULL == new_tail) {
     perror("new_chunk");
-    return -1;
+    goto fail;
   }
 
   /* Initialize and make it the new tail */
   new_tail->ref_count = nrefs;
-  chunks->tail->next = new_tail;
+  new_tail->data = malloc(CHUNK_SZ);
+  if (NULL == new_tail->data) {
+    perror("new_chunk");
+    goto fail;
+  }
+
+#ifdef HAVE_PTHREADS
+  {
+    int r = pthread_mutex_init(&new_tail->lock, NULL);
+    if (r != 0) {
+      fprintf(stderr, "pthread_mutex_init: %s\n", strerror(r));
+      goto fail;
+    }
+  }
+#endif
+
+  if (NULL != chunks->tail) {
+    LOCK_MUTEX(&chunks->tail->lock);
+    chunks->tail->next = new_tail;
+    UNLOCK_MUTEX(&chunks->tail->lock);
+  }
+  LOCK_MUTEX(&chunks->lock);
   chunks->tail = new_tail;
+  UNLOCK_MUTEX(&chunks->lock);
 
   return 0;
+
+ fail:
+  if (new_tail) {
+    free(new_tail->data);
+    free(new_tail);
+  }
+  return -1;
 }
 
 /*
@@ -766,30 +939,56 @@ static int new_chunk(ChunkList *chunks, int nrefs) {
 
 static int release_chunk(ChunkList *chunks, Chunk *chunk,
 			 Opts *options, SpillControl *spillage) {
-  if (--chunk->ref_count > 0) {
-    if (spillage->alloced >= options->max
+  unsigned int ref_count;
+  size_t alloced;
+  int data_gone = 0;
+
+  /* chunck should be locked when calling this */
+  assert(chunk->ref_count > 0);
+  ref_count = --chunk->ref_count;
+  UNLOCK_MUTEX(&chunk->lock);
+  LOCK_MUTEX(&spillage->lock);
+  alloced = spillage->alloced;
+  UNLOCK_MUTEX(&spillage->lock);
+
+  if (ref_count > 0) {
+    LOCK_MUTEX(&chunk->lock);
+    if (alloced >= options->max
 	&& chunk->nwriters == 0
 	&& NULL != chunk->spill
 	&& NULL != chunk->data) {
       /* Re-spill data if still under memory pressure */
       free(chunk->data);
       chunk->data = NULL;
+      data_gone = 1;
+    }
+    UNLOCK_MUTEX(&chunk->lock);
+    if (data_gone) {
+      LOCK_MUTEX(&spillage->lock);
       spillage->alloced -= CHUNK_SZ;
+      UNLOCK_MUTEX(&spillage->lock);
     }
     return 0;
   }
 
-  /* No more readers for the chunk, so free it */
+  /* No more readers for the chunk, so free it. */
+  /* Only one thread can get ref_count == 0, so no need to lock chunk
+     any more. */
+  LOCK_MUTEX(&chunks->lock);
   assert(chunk == chunks->head); /* Should be head of list */
   chunks->head = chunk->next;
   if (chunk == chunks->spilled) chunks->spilled = NULL;
+  UNLOCK_MUTEX(&chunks->lock);
   if (NULL != chunk->spill) {
     if (0 != release_tmp(chunk->spill, spillage)) return -1;
   }
   if (NULL != chunk->data) {
     free(chunk->data);
+    LOCK_MUTEX(&spillage->lock);
     spillage->alloced -= CHUNK_SZ;
+    UNLOCK_MUTEX(&spillage->lock);
   }
+  DESTROY_MUTEX(&chunk->lock);
   free(chunk);
 
   return 0;
@@ -810,9 +1009,50 @@ static int release_chunk(ChunkList *chunks, Chunk *chunk,
 
 static int release_chunks(ChunkList *chunks, Chunk *chunk,
 			  Opts *options, SpillControl *spillage) {
-  for (;NULL != chunk; chunk = chunk->next) {
+  Chunk *next_chunk;
+  while (NULL != chunk) {
+    LOCK_MUTEX(&chunk->lock); /* release_chunk unlocks */
+    next_chunk = chunk->next;
     if (0 != release_chunk(chunks, chunk, options, spillage)) return -1;
+    chunk = next_chunk;
   }
+  return 0;
+}
+
+/* 
+ * Work out what to do if the reader has run out of space.
+ * Returns 2 if the reader should block with a timeout
+ *         1 if the reader should block with no timeout
+ *         0 if the reader should spill data
+ *        -1 if an error occurred
+ */
+
+static inline int wait_or_spill(Opts *options, SpillControl *spillage) {
+  double now;
+  if (options->wait_time <= 0 || spillage->pipe_list_head != NULL) return 0;
+  if (spillage->pipe_list_head->is_reg) {
+    /* Slowest output is a regular file in multi-thread mode,
+       don't want to spill anything for this so always wait */
+    spillage->blocking_output = spillage->pipe_list_head;
+    return 1;
+  }
+
+  /* Slowest output is a pipe.  Check to see how long ago it was when it
+     last wrote something */
+  now = get_time();
+  if (now < 0) return -1;
+  if (now < spillage->pipe_list_head->write_time) {
+    /* Someone fiddled with the clock? */
+    spillage->pipe_list_head->write_time = now;
+  }
+  if (now - spillage->pipe_list_head->write_time < options->wait_time){
+    /* Not waited long enough, so get reader to wait for a while and
+       try again after the time limit should have expired. */
+    spillage->blocking_output = spillage->pipe_list_head;
+    return 2;
+  }
+
+  /* Waited long enough, get the reader to start spilling data */
   return 0;
 }
 
@@ -828,7 +1068,9 @@ static int release_chunks(ChunkList *chunks, Chunk *chunk,
  * *read_eof is the end-of-file flag
  * nrefs     is the reference count to set on new Chunks.
  *
- * Returns  0 on success
+ * Returns  2 if nothing written and should wait with time-out
+ *          1 if nothing written and should wait
+ *          0 on success
  *         -1 in failure
  */
 
@@ -836,49 +1078,51 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
 		       ChunkList *chunks, int *read_eof, int nrefs) {
   ssize_t bytes;
 
+  LOCK_MUTEX(&spillage->lock);
   spillage->blocking_output = NULL;
+  if (options->use_threads) {
+    /* Check that the outputs are keeping up if in threaded mode.
+       If not, wait until an output writes something. */
+    if (in->pos - spillage->max_all > CHUNK_SZ * 20
+	|| (spillage->npipes > 0 && in->pos - spillage->max_pipe > CHUNK_SZ * 20)) {
+      spillage->blocking_output = ANY_OUTPUT;
+      UNLOCK_MUTEX(&spillage->lock);
+      return 1;
+    }
+  }
+  UNLOCK_MUTEX(&spillage->lock);
 
-  if (chunks->tail->len == CHUNK_SZ || NULL == chunks->tail->data) {
+  assert(NULL != chunks->tail->data);
 
+  if (chunks->tail->len == CHUNK_SZ) {
+
+    LOCK_MUTEX(&spillage->lock);
     if (spillage->alloced >= options->max) {
-      if (options->wait_time > 0 && spillage->pipe_list_head != NULL) {
-	double now = get_time();
-	if (now < 0) return -1;
-	if (now < spillage->pipe_list_head->write_time) {
-	  /* Someone fiddled with the clock? */
-	  spillage->pipe_list_head->write_time = now;
-	}
-	if (now - spillage->pipe_list_head->write_time < options->wait_time) {
-	  /* Not waited long enough, so return without reading anything */
-	  spillage->blocking_output = spillage->pipe_list_head;
-	  return 0;
-	}
-      }
-
+      /* Run out of memory, check if the reader should wait or start
+	 spilling data */
+      int r = wait_or_spill(options, spillage);
+      UNLOCK_MUTEX(&spillage->lock);
+      if (r) return r; /* Decided to wait */
       if (0 != spill_data(options, chunks, spillage)) return -1;
+    } else {
+      UNLOCK_MUTEX(&spillage->lock);
     }
 
-    if (chunks->tail->len == CHUNK_SZ) {
-      /* Need to start a new Chunk */
-      if (0 != new_chunk(chunks, nrefs)) return -1;
-      
-      if (NULL != spillage->spill && !spillage->spill->is_tmp) {
-	/* Set starting offset for spillage purposes */
-	chunks->tail->spill_offset = in->pos;
-	chunks->tail->spill = spillage->spill;
-      }
+    /* Need to start a new Chunk */
+    if (0 != new_chunk(chunks, nrefs)) return -1;
+
+    LOCK_MUTEX(&spillage->lock);
+    if (NULL != spillage->spill && !spillage->spill->is_tmp) {
+      /* Set starting offset for spillage purposes */
+      chunks->tail->spill_offset = in->pos;
+      chunks->tail->spill = spillage->spill;
     }
 
-    /* Allocate a buffer to put the data in */
-    chunks->tail->data = malloc(CHUNK_SZ);
-    if (NULL == chunks->tail->data) {
-      perror("do_read");
-      return -1;
-    }
     spillage->alloced += CHUNK_SZ;
     if (spillage->alloced > spillage->max_alloced) {
       spillage->max_alloced = spillage->alloced;
     }
+    UNLOCK_MUTEX(&spillage->lock);
   }
 
   /* Read some data */ 
@@ -888,11 +1132,16 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
   } while (bytes < 0 && errno == EINTR);
   
   if (bytes < 0) { /* Error */
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; /* Blocking is OK */
+    if ((errno == EAGAIN || errno == EWOULDBLOCK)
+	&& !options->use_threads) return 0; /* Blocking is OK */
     fprintf(stderr, "Error reading %s : %s\n",
 	    options->in_name, strerror(errno));
     return -1;
   }
+
+  LOCK_MUTEX(&chunks->lock);
+  chunks->read_count++;
+  UNLOCK_MUTEX(&chunks->lock);
 
   if (bytes == 0) { /* EOF */
     *read_eof = 1;
@@ -904,7 +1153,9 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
 
   /* Got some data, update length and in->pos */
   in->pos += bytes;
+  LOCK_MUTEX(&chunks->tail->lock);
   chunks->tail->len += bytes;
+  UNLOCK_MUTEX(&chunks->tail->lock);
 
   if (verbosity > 2) {
     fprintf(stderr, "%.3f Read %zd bytes from input; %lld (%sB) so far.\n",
@@ -931,21 +1182,30 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
 static ssize_t do_write(Output *output, ChunkList *chunks,
 			Opts *options, SpillControl *spillage, int index) {
   ssize_t bytes = 0;
-  Chunk *curr_chunk = output->curr_chunk;
+  Chunk *curr_chunk = output->curr_chunk, *next_chunk;
+  size_t curr_chunk_len;
+  unsigned char *data;
 
-  while (curr_chunk->next != NULL || output->offset < curr_chunk->len) {
+  LOCK_MUTEX(&curr_chunk->lock);
+  next_chunk     = curr_chunk->next;
+  curr_chunk_len = curr_chunk->len;
+  data           = curr_chunk->data;
+  UNLOCK_MUTEX(&curr_chunk->lock);
+
+
+  while (next_chunk != NULL || output->offset < curr_chunk_len) {
     /* While there's something to write ... */
 
-    assert(NULL != curr_chunk->data);
+    assert(NULL != data);
 
-    if (output->offset < curr_chunk->len) {
+    if (output->offset < curr_chunk_len) {
       /* Data available in the current Chunk */
       ssize_t b;
 
       /* Send it */
       do {
-	b = write(output->fd, curr_chunk->data + output->offset,
-		  curr_chunk->len - output->offset);
+	b = write(output->fd, data + output->offset,
+		  curr_chunk_len - output->offset);
       } while (b < 0 && EINTR == errno);
 
       if (b < 0) { /* Error */
@@ -958,15 +1218,39 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
 
       if (b == 0) break;  /* Wrote nothing, try again later */
 
-      /* Update amount read */
-      output->written += b;
+      /* Update amount written */
+      LOCK_MUTEX(&spillage->lock); /*spillage due to linked list update below*/
+      {
+	int do_broadcast = 0;
+	output->written += b;
+	if (output->written > spillage->max_all) {
+	  spillage->max_all = output->written;
+	  do_broadcast = 1;
+	}
+	if (!output->is_reg && output->written > spillage->max_pipe) {
+	  spillage->max_pipe = output->written;
+	  do_broadcast = 1;
+	}
+	if (do_broadcast) {
+#ifdef HAVE_PTHREADS
+	  int r;
+	  if (0 != (r = pthread_cond_signal(&spillage->data_written))) {
+	    fprintf(stderr, "pthread_cond_signal : %s\n", strerror(r));
+	    abort();
+	  }
+#endif
+	}
+      }
+      UNLOCK_MUTEX(&spillage->lock);
       output->offset += b;
       bytes += b;
 
       /* Record time and update linked list */
-      if (!output->is_reg) {
+      if (!output->is_reg || options->use_threads) {
+	LOCK_MUTEX(&spillage->lock);
 	output->write_time = get_time();
 	if (output->write_time < 0) {
+	  UNLOCK_MUTEX(&spillage->lock);
 	  return -1;
 	}
 	
@@ -979,34 +1263,52 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
 	}
 
 	if (output == spillage->blocking_output) {
+#ifdef HAVE_PTHREADS
+	  int r;
+#endif
 	  spillage->blocking_output = spillage->pipe_list_head;
+#ifdef HAVE_PTHREADS
+	  if (0 != (r = pthread_cond_signal(&spillage->data_written))) {
+	    fprintf(stderr, "pthread_cond_signal : %s\n", strerror(r));
+	    abort();
+	  }
+#endif
 	}
+	UNLOCK_MUTEX(&spillage->lock);
       }
     }
 
-    assert(output->offset <= curr_chunk->len);
+    assert(output->offset <= curr_chunk_len);
 
     /* Check if at end of current Chunk */
-    if (output->offset == curr_chunk->len) {
+    if (output->offset == curr_chunk_len) {
       /* Stop sending if no more Chunks yet */
-      if (NULL == curr_chunk->next) break;
+      if (NULL == next_chunk) break;
 
       /* Otherwise, move on to the next Chunk */
-      output->curr_chunk = curr_chunk->next;
+      output->curr_chunk = next_chunk;
       output->offset = 0;
 
+      LOCK_MUTEX(&curr_chunk->lock);  /* release_chunk unlocks */
       --curr_chunk->nwriters;
       if (0 != release_chunk(chunks, curr_chunk, options, spillage)) {
 	return -1;
       }
 
-      curr_chunk = output->curr_chunk;
-      curr_chunk->nwriters++;
+      curr_chunk = next_chunk;
 
-      if (NULL == curr_chunk->data) {
-	/* Need to re-read spilled data */
-	if (0 != reread_data(curr_chunk, spillage)) return -1;
-      }
+      LOCK_MUTEX(&curr_chunk->lock);
+      curr_chunk->nwriters++;
+      UNLOCK_MUTEX(&curr_chunk->lock);
+
+      /* Re-read spilled data if needed */
+      if (0 != reread_data(curr_chunk, spillage)) return -1;
+
+      LOCK_MUTEX(&curr_chunk->lock);
+      next_chunk     = curr_chunk->next;
+      curr_chunk_len = curr_chunk->len;
+      data           = curr_chunk->data;
+      UNLOCK_MUTEX(&curr_chunk->lock);
     }
   }
 
@@ -1071,14 +1373,21 @@ static int do_copy(Opts *options, Input *in,
 		   int nregular, int *regular,
 		   int npipes, int *pipes,
 		   SpillControl *spillage) {
-  ChunkList chunks = { NULL, NULL, NULL }; /* Linked list of Chunks */ 
+  ChunkList chunks = {
+    NULL, NULL, NULL, 0, NULL, 0,
+#ifdef HAVE_PTHREADS
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER
+#endif
+  }; /* Linked list of Chunks */ 
   struct pollfd *polls; /* structs for poll(2) */
   int   *poll_idx;    /* indexes in outputs corresponding to entries in polls */
   int   *closing_pipes; /* Pipes that need to be closed */
   int   *closing_reg;   /* Regular files that need to be closed */
   int i, keeping_up = npipes, read_eof = 0, nclosed = 0;
 
-  chunks.head = chunks.tail = calloc(1, sizeof(Chunk));  /* Initial Chunk */
+  if (0 != new_chunk(&chunks, noutputs)) return -1; /* Initial Chunk */
+  chunks.head = chunks.tail;
+  chunks.head->nwriters  = noutputs;
   polls         = malloc((noutputs + 1) * sizeof(struct pollfd));
   poll_idx      = malloc((noutputs + 1) * sizeof(int));
   closing_pipes = malloc((npipes + 1)   * sizeof(int));
@@ -1088,9 +1397,6 @@ static int do_copy(Opts *options, Input *in,
     perror("do_copy");
     return -1;
   }
-
-  chunks.head->ref_count = noutputs;
-  chunks.head->nwriters  = noutputs;
 
   /* Point all outputs to the initial Chunk and build linked list of pipes */
   for (i = 0; i < noutputs; i++) {
@@ -1133,8 +1439,8 @@ static int do_copy(Opts *options, Input *in,
     if (should_read) {
       if (in->reg) {
 	/* If reading a regular file, do it now */
-	if (0 != do_read(options, in, spillage, &chunks, &read_eof,
-			 noutputs - nclosed)) {
+	if (do_read(options, in, spillage, &chunks, &read_eof,
+		    noutputs - nclosed) < 0) {
 	  return -1;
 	}
       } else {
@@ -1192,8 +1498,8 @@ static int do_copy(Opts *options, Input *in,
 	  
 	  --ready;
 	  if (poll_idx[i] < 0) {  /* Input, try to read from it. */
-	    if (0 != do_read(options, in, spillage, &chunks,
-			     &read_eof, noutputs - nclosed)) {
+	    if (do_read(options, in, spillage, &chunks,
+			&read_eof, noutputs - nclosed) < 0) {
 	      return -1;
 	    }
 
@@ -1429,8 +1735,13 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
   options->tmp_dir   = DEFAULT_TMP_DIR;
   options->wait_time = DEFAULT_WAIT_TIME;
   options->in_name   = NULL;
+#ifdef HAVE_PTHREADS
+  options->use_threads = 1;
+#else
+  options->use_threads = 0;
+#endif
 
-  while ((opt = getopt(argc, argv, "m:f:t:i:vw:")) != -1) {
+  while ((opt = getopt(argc, argv, "m:f:pPt:i:vw:")) != -1) {
     switch (opt) {
 
     case 'i':
@@ -1464,6 +1775,16 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
       options->max = sz;
       break;
     }
+
+    case 'p':
+#ifdef HAVE_PTHREADS
+      options->use_threads = 1;
+#endif
+      break;
+
+    case 'P':
+      options->use_threads = 0;
+      break;
 
     case 't':
       options->tmp_dir = optarg;
@@ -1500,15 +1821,297 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
   return 0;
 }
 
+#ifdef HAVE_PTHREADS
+
+void * run_write_thread(void *v) {
+  ThreadParams *p = (ThreadParams *) v;
+  Opts *options          = p->options;
+  Output *output         = p->output;
+  SpillControl *spillage = p->spillage;
+  ChunkList *chunks      = p->chunks;
+  int index              = p->index;
+  int is_reg;
+  int res;
+  ssize_t bytes = 0;
+
+  free(p);
+
+  if (0 == strcmp(output->name, "-")) {
+    output->fd = fileno(stdout);
+    output->name = "stdout";
+  } else {
+    output->fd = open(output->name, O_WRONLY|O_CREAT|O_TRUNC, 0666);
+    if (output->fd < 0) {
+      fprintf(stderr, "Couldn't open %s for writing : %s\n",
+	      output->name, strerror(errno));
+      output->res = -1;
+      goto out;
+    }
+  }
+  is_reg = file_is_regular(output->name, output->fd);
+  if (is_reg < 0) {
+    output->res = -1;
+    goto out;
+  }
+
+  LOCK_MUTEX(&spillage->lock);
+  output->is_reg = is_reg;
+  if (is_reg) spillage->npipes--;
+  UNLOCK_MUTEX(&spillage->lock);
+
+  LOCK_MUTEX(&chunks->lock);
+  /* Wait for some data */
+  while (NULL == chunks->head && !chunks->read_eof) {
+    res = pthread_cond_wait(&chunks->new_data, &chunks->lock);
+    if (res != 0 && res != EINTR) {
+      fprintf(stderr, "pthread_cond_wait : %s\n", strerror(res));
+      abort();
+    }
+  }
+  output->curr_chunk = chunks->head;
+  UNLOCK_MUTEX(&chunks->lock);
+
+  if (verbosity > 1) {
+    fprintf(stderr, "%.3f Opened output #%d (%s) on fd %d.\n",
+	    get_time(), index, output->name, output->fd);
+  }
+
+  for (;;) {
+    int at_end, read_eof;
+    size_t read_count;
+    
+    LOCK_MUTEX(&chunks->lock);
+    read_eof = chunks->read_eof;
+    read_count = chunks->read_count;
+    UNLOCK_MUTEX(&chunks->lock);
+    LOCK_MUTEX(&output->curr_chunk->lock);
+    at_end = (output->curr_chunk->next == NULL
+	      && output->offset >= output->curr_chunk->len);
+    UNLOCK_MUTEX(&output->curr_chunk->lock);
+
+    if (at_end) {
+      if (read_eof) { /* Finished */
+	break;
+      } else {        /* Wait for more data */
+	LOCK_MUTEX(&chunks->lock);
+	if (!chunks->read_eof && read_count == chunks->read_count) {
+	  /* ensure nothing changed */
+	  res = pthread_cond_wait(&chunks->new_data, &chunks->lock);
+	  if (res != 0) {
+	    fprintf(stderr, "pthread_cond_wait : %s\n", strerror(res));
+	    abort();
+	  }
+	}
+	UNLOCK_MUTEX(&chunks->lock);
+      }
+    }
+
+    bytes = do_write(output, chunks, options, spillage, index);
+    if (bytes < 0) {
+      if (bytes == -1) output->res = -1;
+      break;
+    }
+  }
+
+  if (0 != close(output->fd)) {
+    fprintf(stderr, "Error closing %s : %s\n", output->name, strerror(errno));
+    output->res = -1;
+  }
+  if (verbosity > 1) {
+    fprintf(stderr, "%.3f Closed output #%d (%s)\n",
+	    get_time(), index, output->name);
+  }
+  output->fd = -1;
+
+#if 0
+  if (0 != release_chunks(&chunks, output->curr_chunk,
+			  options, spillage)) {
+    output->res = -1;
+  }
+#endif
+
+ out:
+  LOCK_MUTEX(&spillage->lock);
+  pipe_list_remove(output, spillage);
+  if (!output->is_reg) spillage->npipes--;
+  UNLOCK_MUTEX(&spillage->lock);
+  LOCK_MUTEX(&chunks->lock);
+  output->next = chunks->closed;
+  chunks->closed = output;
+  UNLOCK_MUTEX(&chunks->lock);
+
+  return NULL;
+}
+
+int start_output_threads(Opts *options, int n, char **names, Output *outputs,
+			 SpillControl *spillage, ChunkList *chunks) {
+  int i, res;
+  ThreadParams *p = NULL;
+
+  for (i = 0; i < n; i++) {
+    outputs[i].name = names[i];
+    outputs[i].res  = 0;
+    outputs[i].curr_chunk = NULL;
+    outputs[i].offset  = 0;
+    outputs[i].written = 0;
+    outputs[i].is_reg = 0;
+    outputs[i].fd = -1;
+    outputs[i].write_time = get_time();
+    pipe_list_push(&outputs[i], spillage);
+  }
+
+  for (i = 0; i < n; i++) {
+    p = malloc(sizeof(ThreadParams));
+    if (NULL == p) goto memfail;
+    p->options  = options;
+    p->output   = &outputs[i];
+    p->spillage = spillage;
+    p->chunks   = chunks;
+    p->index    = i;
+
+    res = pthread_create(&outputs[i].thread, NULL, run_write_thread, p);
+    if (res) goto fail;
+  }
+
+  return 0;
+ memfail:
+  res = errno;
+ fail:
+  fprintf(stderr, "Couldn't start output thread #%d: %s\n", i, strerror(res));
+  return -1;
+}
+
+int do_thread_copy(Opts *options, Input *in, int noutputs, Output *outputs,
+		   SpillControl *spillage, ChunkList *chunks) {
+  int read_eof = 0, nclosed = 0;
+  int res = 0, r, i;
+  ssize_t b;
+  unsigned char *joined;
+
+  joined = calloc(noutputs, sizeof(unsigned char));
+  if (NULL == joined) {
+    perror("do_thread_copy");
+    return -1;
+  }
+
+  for (;;) {
+    Output *closed;
+
+    LOCK_MUTEX(&chunks->lock);
+    closed   = chunks->closed;
+    chunks->closed = NULL;
+    UNLOCK_MUTEX(&chunks->lock);
+
+    if (read_eof) break;
+
+    while (NULL != closed) {
+      /* deal with closed outputs */
+      nclosed++;
+      if (closed->res != 0) res = -1;
+      if (0 != release_chunks(chunks, closed->curr_chunk,
+			      options, spillage)) {
+	closed->res = -1;
+      }
+      if (0 != (r = pthread_join(closed->thread, NULL))) {
+	fprintf(stderr, "pthread_join : %s\n", strerror(r));
+	res = -1;
+      }
+      joined[closed - outputs] = 1;
+      closed = closed->next;
+    }
+    if (nclosed == noutputs) break;
+
+    b = do_read(options, in, spillage, chunks, &read_eof, noutputs - nclosed);
+    if (b < 0) {
+      res = -1;
+      read_eof = 1;
+    }
+
+    if (read_eof) {
+      LOCK_MUTEX(&chunks->lock);
+      chunks->read_eof = read_eof;
+      UNLOCK_MUTEX(&chunks->lock);
+      break;
+    }
+
+    LOCK_MUTEX(&chunks->lock);
+    if (0 != (r = pthread_cond_broadcast(&chunks->new_data))) {
+      fprintf(stderr, "pthread_cond_broadcast : %s\n", strerror(errno));
+      abort();
+    }
+    UNLOCK_MUTEX(&chunks->lock);
+
+    LOCK_MUTEX(&spillage->lock);
+    if (NULL != spillage->blocking_output) {
+      /* Pause while we wait for a slow output to catch up.
+	 do_read should have set b to 1 or 2 depending on if we want to
+	 wait indefinitely or with a time-out. */
+      r = 0;
+      if (b == 1) {
+	r = pthread_cond_wait(&spillage->data_written, &spillage->lock);
+      } else {
+	double now = get_time();
+	if (now >= 0 &&
+	    now - spillage->pipe_list_head->write_time < options->wait_time) {
+	  struct timespec timeout;
+	  calc_timeout(&timeout, now, options->wait_time);
+	  r = pthread_cond_timedwait(&spillage->data_written,
+				     &spillage->lock, &timeout);
+	}
+      }
+      if (r != 0 && r != ETIMEDOUT && r != EINTR) {
+	fprintf(stderr, "pthread_cond_timedwait : %s\n", strerror(r));
+	abort();
+      }
+    }
+    UNLOCK_MUTEX(&spillage->lock);
+  }
+
+  /* Wait for remaining data to flush out */
+  LOCK_MUTEX(&chunks->lock);
+  if (0 != (r = pthread_cond_broadcast(&chunks->new_data))) {
+    fprintf(stderr, "pthread_cond_broadcast : %s\n", strerror(errno));
+    abort();
+  }
+  UNLOCK_MUTEX(&chunks->lock);
+  
+  if (nclosed < noutputs) {
+    for (i = 0; i < noutputs; i++) {
+      if (joined[i]) continue;
+      if (0 != (r = pthread_join(outputs[i].thread, NULL))) {
+	fprintf(stderr, "pthread_join : %s\n", strerror(r));
+	res = -1;
+      }
+      if (outputs[i].res < 0) res = -1;
+      joined[i] = 1;
+      nclosed++;
+    }
+  }
+
+  /* paranoia check */
+  for (i = 0; i < noutputs; i++) assert(joined[i] != 0);
+
+  return res;
+}
+#endif
+
 int main(int argc, char** argv) {
   Opts    options;
   int     out_start = argc;
   Input   in = { 0, -1, 0 };
-  Output *outputs = malloc((argc - 1) * sizeof(Output));
+  Output *outputs = calloc((argc - 1), sizeof(Output));
   int    *regular = malloc((argc - 1) * sizeof(int));
   int    *pipes   = malloc((argc - 1) * sizeof(int));
-  SpillControl spillage = { NULL, NULL, NULL, NULL,
-			    0, 0, 0, 0, 0, 0, 0, 0 };  /* Spillage info. */
+  SpillControl spillage = {
+    NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+#ifdef HAVE_PTHREADS
+    PTHREAD_MUTEX_INITIALIZER
+#endif
+  };  /* Spillage info. */
+#ifdef HAVE_PTHREADS
+  ChunkList chunks = { NULL, NULL, NULL, 0, NULL, 0, PTHREAD_MUTEX_INITIALIZER, 
+		       PTHREAD_COND_INITIALIZER };
+#endif
   int     nregular = 0, npipes = 0;
   struct sigaction sig;
 
@@ -1518,6 +2121,7 @@ int main(int argc, char** argv) {
   }
 
   /* Ignore SIGPIPEs, we want write(2) to get EPIPE instead. */
+  memset(&sig, 0, sizeof(sig));
   sig.sa_handler = SIG_IGN;
   if (0 != sigaction(SIGPIPE, &sig, NULL)) {
     perror("sigaction");
@@ -1528,30 +2132,63 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  if (verbosity > 0) {
-    fprintf(stderr, "%.3f Started.\n", get_time());
-  }
-
-  if (0 != open_input(&options, &in, &spillage)) {
-    return EXIT_FAILURE;
-  }
-
   if (out_start >= argc) {
     fprintf(stderr, "No output files specified\n");
     return EXIT_FAILURE;
   }
 
-  /* Open the output files */
-  if (open_outputs(argc - out_start, argv + out_start, outputs,
-		   regular, pipes, &nregular, &npipes) != 0) {
+  if (verbosity > 0) {
+    fprintf(stderr, "%.3f Started.\n", get_time());
+  }
+
+  spillage.npipes = argc - out_start;
+
+#ifdef HAVE_PTHREADS
+  if (options.use_threads) {
+    if (0 != new_chunk(&chunks, argc - out_start)) return EXIT_FAILURE;
+    chunks.head = chunks.tail;
+    chunks.head->nwriters  = argc - out_start;
+
+    /* Open the output files */
+    if (start_output_threads(&options, argc - out_start, argv + out_start,
+			     outputs, &spillage, &chunks) != 0){
+      return EXIT_FAILURE;
+    }
+  }
+#endif
+
+  if (0 != open_input(&options, &in, &spillage)) {
     return EXIT_FAILURE;
   }
-  
-  /* Copy input to all outputs */
-  if (do_copy(&options, &in, argc - out_start, outputs,
-	      nregular, regular, npipes, pipes, &spillage) != 0) {
-    return EXIT_FAILURE;
+
+#ifdef HAVE_PTHREADS
+  if (!options.use_threads) {
+#endif
+    /* Open the output files now if single-threaded */
+    if (open_outputs(argc - out_start, argv + out_start, outputs,
+		     regular, pipes, &nregular, &npipes) != 0) {
+      return EXIT_FAILURE;
+    }
+#ifdef HAVE_PTHREADS
   }
+#endif
+
+#ifdef HAVE_PTHREADS
+  if (options.use_threads) {
+    if (do_thread_copy(&options, &in, argc - out_start,
+		       outputs, &spillage, &chunks) != 0) {
+      return EXIT_FAILURE;
+    }
+  } else {
+#endif
+    /* Copy input to all outputs */
+    if (do_copy(&options, &in, argc - out_start, outputs,
+		nregular, regular, npipes, pipes, &spillage) != 0) {
+      return EXIT_FAILURE;
+    }
+#ifdef HAVE_PTHREADS
+  }
+#endif
 
   if (verbosity > 0) {
     fprintf(stderr, "%.3f Finished.\n", get_time());

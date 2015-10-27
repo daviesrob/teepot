@@ -23,4 +23,6 @@ bin_PROGRAMS = teepot
 
 teepot_SOURCES = teepot.c
 
+teepot_LDADD = -lm
+
 dist_man1_MANS = man/man1/teepot.1
