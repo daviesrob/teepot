@@ -473,17 +473,18 @@ char * get_input_file(Test *test) {
  *         -1 on failure
  */
 
-pid_t start_prog(char *prog, Test *test, int *in_fd,
+pid_t start_prog(int argc, char **argv, Test *test, int *in_fd,
 		 char *in_file, char **fifos, char **out_files) {
   int pipefds[2];
   static char **args = NULL;
   static unsigned int nargs = 0;
+  char *prog;
   pid_t pid;
   unsigned int i, arg = 0;
 
   /* Allocate space for the argument list */
-  if (nargs < test->nfiles + test->npipes + ARGS_EXTRA) {
-    nargs = test->nfiles + test->npipes + ARGS_EXTRA;
+  if (nargs < test->nfiles + test->npipes + ARGS_EXTRA + argc - 1) {
+    nargs = test->nfiles + test->npipes + ARGS_EXTRA + argc - 1;
     args = realloc(args, nargs * sizeof(char *));
     if (NULL == args) {
       perror("Couldn't allocate space for argument list");
@@ -491,8 +492,11 @@ pid_t start_prog(char *prog, Test *test, int *in_fd,
     }
   }
 
-  /* args[0] is the program name */
-  args[arg++] = prog;
+  /* copy argv */
+  for (i = 0; i < argc; i++) {
+    args[arg++] = argv[i];
+  }
+  prog = argv[0];
 
   if (test->in_type == IN_FILE) {
     /* File input, add -i filename to arguments */
@@ -1027,7 +1031,8 @@ char * summarize_test(Test *test) {
  *         99 if some other failure occurred while trying to run the test
  */
 
-int run_test(char *prog, unsigned int test_num, Test *test, char **fifos) {
+int run_test(int argc, char **argv,
+	     unsigned int test_num, Test *test, char **fifos) {
   char  *in_file   = NULL;
   int    in_fd     = -1;
   char **out_files = NULL;
@@ -1054,7 +1059,7 @@ int run_test(char *prog, unsigned int test_num, Test *test, char **fifos) {
   }
 
   /* Start the program under test */
-  child = start_prog(prog, test, &in_fd, in_file, fifos, out_files);
+  child = start_prog(argc, argv, test, &in_fd, in_file, fifos, out_files);
   if (child < 0) goto BAIL;
 
   /* Open any named pipes required */
@@ -1121,7 +1126,7 @@ int run_test(char *prog, unsigned int test_num, Test *test, char **fifos) {
  *         99 if a fatal error occured, so not all tests were run
  */
 
-int run_tests(char *prog) {
+int run_tests(int argc, char **argv) {
   char *fifos[MAX_READERS] = { NULL };
   /* The test schedule */
   TestSegment test_segs1[1] = {{{ 100 }}};
@@ -1176,7 +1181,7 @@ int run_tests(char *prog) {
   for (i = 0; i < ntests; i++) {
     Test t = tests[i];
     for (t.in_type = IN_PIPE; t.in_type <= IN_FILE; t.in_type++) {
-      res = run_test(prog, ++test_num, &t, fifos);
+      res = run_test(argc, argv, ++test_num, &t, fifos);
       /* Print the result to the driver */
       printf("%s %d - %s\n", res ? "not ok" : "ok",
 	     test_num, summarize_test(&t));
@@ -1238,6 +1243,6 @@ int main(int argc, char **argv) {
   }
 
   /* Run the tests */
-  if (run_tests(argv[1]) != 0) return 1;
+  if (run_tests(argc - 1, argv + 1) != 0) return 1;
   return 0;
 }
