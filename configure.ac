@@ -32,6 +32,9 @@ AC_REQUIRE_AUX_FILE([tap-driver.sh])
 AC_PROG_CC
 AC_PROG_AWK
 
+# Turn on C compiler warnings
+VL_PROG_CC_WARNINGS
+
 # Check for pthreads
 AC_SUBST([HAVE_PTHREADS])
 AC_ARG_ENABLE([pthreads],
