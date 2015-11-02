@@ -78,11 +78,11 @@ typedef struct SpillFile {
 } SpillFile;
 
 /* A chunk of input */
-typedef enum {
-  in_core,
-  spilling,
-  spilled,
-  rereading
+typedef enum {    /* Spillage state */
+  in_core,        /* Normal state: data present in memory */
+  spilling,       /* Data is currently being written to a spill file */
+  spilled,        /* Data has been spilled */
+  rereading       /* Data is being read back from the spill file */
 } ChunkState;
 
 typedef struct Chunk {
@@ -133,12 +133,11 @@ typedef struct ChunkList {
   Chunk *tail;    /* List tail */
   int    read_eof; /* Reading finished (threaded mode only) */
   Output *closed;  /* Closed outputs (threaded mode only) */
-  size_t read_count;
 #ifdef HAVE_PTHREADS
-  pthread_mutex_t lock;
-  pthread_cond_t  new_data;
-  pthread_cond_t  spill_complete;
-  pthread_cond_t  reread_complete;
+  pthread_mutex_t lock;         /* Global lock for everything */
+  pthread_cond_t  new_data;     /* Signalled when new data arrives */
+  pthread_cond_t  data_written; /* Signalled when data is written out */
+  pthread_cond_t  state_change; /* Signalled when any chunk->state changes */
 #endif
 } ChunkList;
 
@@ -159,10 +158,6 @@ typedef struct {
   int        max_spill_files;  /* Max number of spill files opened */
   int        spill_file_count; /* Spill file count */
   int        npipes;           /* Number of pipes still open */
-#ifdef HAVE_PTHREADS
-  pthread_mutex_t lock;
-  pthread_cond_t  data_written;
-#endif
 } SpillControl;
 
 #ifdef HAVE_PTHREADS
@@ -198,12 +193,21 @@ typedef struct {
     }									\
   } while (0)
 
+#define COND_SIGNAL(C) do {						\
+    int cb_res = pthread_cond_signal(C);				\
+    if (cb_res != 0) {							\
+      fprintf(stderr, "pthread_cond_signal : %s\n", strerror(cb_res));	\
+      abort();								\
+    }									\
+  } while (0)
+
 #else
 
 #define LOCK_MUTEX(M) do { } while (0)
 #define UNLOCK_MUTEX(M) do { } while (0)
 #define DESTROY_MUTEX(M) do { } while (0)
 #define COND_BROADCAST(C) do { } while (0)
+#define COND_SIGNAL(C) do { } while (0)
 
 #endif
 
@@ -626,17 +630,19 @@ static SpillFile * make_tmp_file(Opts *options, SpillFile *current) {
  *         -1 on failure
  */
 
-int release_tmp(SpillFile *spill, SpillControl *spillage) {
-  LOCK_MUTEX(&spillage->lock);
+int release_tmp(SpillFile *spill, SpillControl *spillage,
+		ChunkList *chunks) {
+  LOCK_MUTEX(&chunks->lock);
+  assert(spill->ref_count > 0);
   if (!spill->is_tmp || --spill->ref_count > 0) {
-    UNLOCK_MUTEX(&spillage->lock);
+    UNLOCK_MUTEX(&chunks->lock);
     return 0;  /* Still in use */
   }
 
   if (spillage->spill == spill) spillage->spill = NULL;
   spillage->curr_spilled -= spill->offset;
   spillage->open_spill_files--;
-  UNLOCK_MUTEX(&spillage->lock);
+  UNLOCK_MUTEX(&chunks->lock);
 
   if (0 != close(spill->fd)) {
     perror("Closing temporary file");
@@ -704,8 +710,8 @@ static int pread_all(int fd, unsigned char *data, size_t len, off_t offset) {
       bytes = pread(fd, data + got, len - got, offset + got);
     } while (bytes < 0 && EINTR == errno);
     if (bytes < 0) {
-      abort();
       perror("Reading temporary file");
+      abort();
       return -1;
     }
     if (bytes == 0) {
@@ -731,7 +737,7 @@ static int pread_all(int fd, unsigned char *data, size_t len, off_t offset) {
 
 static int spill_data(Opts *options, ChunkList *chunks,
 		      SpillControl *spillage) {
-  SpillFile *spill;
+  SpillFile *spill = NULL;
   Chunk *candidate;
 
   /* Look for a chunk that can be spilled */
@@ -759,23 +765,19 @@ static int spill_data(Opts *options, ChunkList *chunks,
     candidate->data = NULL;
     candidate->state = spilled;
     chunks->spilled = candidate;
-    UNLOCK_MUTEX(&chunks->lock);
-    LOCK_MUTEX(&spillage->lock);
     spillage->alloced -= CHUNK_SZ;
-    UNLOCK_MUTEX(&spillage->lock);
+    UNLOCK_MUTEX(&chunks->lock);
     return 0;
   }
 
   candidate->state = spilling;
-  UNLOCK_MUTEX(&chunks->lock);
 
   /* Otherwise have to store it somewhere */
-  LOCK_MUTEX(&spillage->lock);
   if (NULL == spillage->spill || spillage->spill->offset >= options->file_max) {
-    UNLOCK_MUTEX(&spillage->lock);
+    UNLOCK_MUTEX(&chunks->lock);
     spill = make_tmp_file(options, spillage->spill);
     if (NULL == spill) goto fail;
-    LOCK_MUTEX(&spillage->lock);
+    LOCK_MUTEX(&chunks->lock);
 
     spillage->spill_file_count++;
     if (spillage->spill_file_count > 0) {
@@ -795,7 +797,8 @@ static int spill_data(Opts *options, ChunkList *chunks,
   } else {
     spill = spillage->spill;
   }
-  UNLOCK_MUTEX(&spillage->lock);
+  spill->ref_count++;
+  UNLOCK_MUTEX(&chunks->lock);
 
   if (0 != write_all(spill->fd, candidate->data, candidate->len)) {
     perror("Writing to temporary file");
@@ -813,11 +816,8 @@ static int spill_data(Opts *options, ChunkList *chunks,
   candidate->spill_offset = spill->offset;
   free(candidate->data);
   candidate->data = NULL;
-  UNLOCK_MUTEX(&chunks->lock);
 
-  LOCK_MUTEX(&spillage->lock);
   spill->offset += candidate->len;
-  spill->ref_count++;
   
   spillage->alloced -= CHUNK_SZ;
 
@@ -828,12 +828,10 @@ static int spill_data(Opts *options, ChunkList *chunks,
   }
 
   spillage->spill = spill;
-  UNLOCK_MUTEX(&spillage->lock);
 
-  LOCK_MUTEX(&chunks->lock);
   chunks->spilled = candidate;
   candidate->state = spilled;
-  COND_BROADCAST(&chunks->spill_complete);
+  COND_BROADCAST(&chunks->state_change);
   UNLOCK_MUTEX(&chunks->lock);
 
   return 0;
@@ -841,8 +839,9 @@ static int spill_data(Opts *options, ChunkList *chunks,
  fail:
   /* Ensure any threads waiting on chunks->spill_complete get restarted */
   LOCK_MUTEX(&chunks->lock);
+  if (NULL != spill) --spill->ref_count;
   candidate->state = in_core;
-  COND_BROADCAST(&chunks->spill_complete);
+  COND_BROADCAST(&chunks->state_change);
   UNLOCK_MUTEX(&chunks->lock);
 
   return -1;
@@ -862,11 +861,16 @@ static int reread_data(ChunkList *chunks, Chunk *chunk,
 		       SpillControl *spillage) {
   unsigned char *data = NULL;
   size_t len;
+  int is_tmp;
   SpillFile *spill;
   off_t spill_offset;
 #ifdef HAVE_PTHREADS
   int res;
 #endif
+
+  /* Check chunk state.  In multi-threaded mode it's possible that another
+     thread might already be trying to get the data back.  If that is the
+     case wait for a state change and check again. */
 
   LOCK_MUTEX(&chunks->lock);
   do {
@@ -878,15 +882,8 @@ static int reread_data(ChunkList *chunks, Chunk *chunk,
 
 #ifdef HAVE_PTHREADS
     case rereading: /* Wait for other thread to finish re-reading data */
-      res = pthread_cond_wait(&chunks->reread_complete, &chunks->lock);
-      if (res != 0 && res != EINTR) {
-	fprintf(stderr, "pthread_cond_wait : %s\n", strerror(res));
-	abort();
-      }
-      break;
-
-    case spilling: /* Wait for spillage to finish */
-      res = pthread_cond_wait(&chunks->spill_complete, &chunks->lock);
+    case spilling:  /* Wait for spillage to finish */
+      res = pthread_cond_wait(&chunks->state_change, &chunks->lock);
       if (res != 0 && res != EINTR) {
 	fprintf(stderr, "pthread_cond_wait : %s\n", strerror(res));
 	abort();
@@ -906,6 +903,7 @@ static int reread_data(ChunkList *chunks, Chunk *chunk,
   chunk->state = rereading;
   spill = chunk->spill;
   len = chunk->len;
+  is_tmp = spill->is_tmp;
   spill_offset = chunk->spill_offset;
   assert(chunk->len > 0 && chunk->len <= CHUNK_SZ);
   UNLOCK_MUTEX(&chunks->lock);
@@ -917,38 +915,36 @@ static int reread_data(ChunkList *chunks, Chunk *chunk,
   }
   if (0 != pread_all(spill->fd, data, len, spill_offset)) goto fail;
 
-  LOCK_MUTEX(&spillage->lock);
+  LOCK_MUTEX(&chunks->lock);
   spillage->alloced += CHUNK_SZ;
   if (spillage->alloced > spillage->max_alloced) {
     spillage->max_alloced = spillage->alloced;
   }
-  UNLOCK_MUTEX(&spillage->lock);
 
-  LOCK_MUTEX(&chunks->lock);
+  chunk->data  = data;
+  chunk->state = in_core;
+
+  COND_BROADCAST(&chunks->state_change);
+  UNLOCK_MUTEX(&chunks->lock);
+
   if (verbosity > 2) {
-    if (spill->is_tmp) {
+    if (is_tmp) {
       fprintf(stderr, "%.3f Re-read %zd bytes (%sB) from spill file #%d\n",
-	      get_time(), len, human_size(len), spill->is_tmp);
+	      get_time(), len, human_size(len), is_tmp);
     } else {
       fprintf(stderr, "%.3f Re-read %zd bytes (%sB) from input file\n",
 	      get_time(), len, human_size(len));
     }
   }
   
-  chunk->data  = data;
-  chunk->state = in_core;
-
-  COND_BROADCAST(&chunks->reread_complete);
-  UNLOCK_MUTEX(&chunks->lock);
-
   return 0;
 
  fail:
-  /* Ensure any threads waiting on chunks->reread_complete get restarted */
+  /* Ensure any threads waiting on chunks->state_change get restarted */
   free(data);
   LOCK_MUTEX(&chunks->lock);
   chunk->state = spilled;
-  COND_BROADCAST(&chunks->reread_complete);
+  COND_BROADCAST(&chunks->state_change);
   UNLOCK_MUTEX(&chunks->lock);
 
   return -1;
@@ -1014,19 +1010,11 @@ static int new_chunk(ChunkList *chunks, int nrefs) {
 
 static int release_chunk(ChunkList *chunks, Chunk *chunk,
 			 Opts *options, SpillControl *spillage) {
-  unsigned int ref_count;
-  size_t alloced;
-  int data_gone = 0;
-
   /* chuncks should be locked when calling this */
   assert(chunk->ref_count > 0);
-  ref_count = --chunk->ref_count;
-  LOCK_MUTEX(&spillage->lock);
-  alloced = spillage->alloced;
-  UNLOCK_MUTEX(&spillage->lock);
 
-  if (ref_count > 0) {
-    if (alloced >= options->max
+  if (--chunk->ref_count > 0) { /* Still in use */
+    if (spillage->alloced >= options->max
 	&& chunk->nwriters == 0
 	&& chunk->state == in_core
 	&& NULL != chunk->spill
@@ -1035,14 +1023,9 @@ static int release_chunk(ChunkList *chunks, Chunk *chunk,
       free(chunk->data);
       chunk->data = NULL;
       chunk->state = spilled;
-      data_gone = 1;
+      spillage->alloced -= CHUNK_SZ;
     }
     UNLOCK_MUTEX(&chunks->lock);
-    if (data_gone) {
-      LOCK_MUTEX(&spillage->lock);
-      spillage->alloced -= CHUNK_SZ;
-      UNLOCK_MUTEX(&spillage->lock);
-    }
     return 0;
   }
 
@@ -1052,15 +1035,14 @@ static int release_chunk(ChunkList *chunks, Chunk *chunk,
   assert(chunk == chunks->head); /* Should be head of list */
   chunks->head = chunk->next;
   if (chunk == chunks->spilled) chunks->spilled = NULL;
-  UNLOCK_MUTEX(&chunks->lock);
-  if (NULL != chunk->spill) {
-    if (0 != release_tmp(chunk->spill, spillage)) return -1;
-  }
   if (NULL != chunk->data) {
     free(chunk->data);
-    LOCK_MUTEX(&spillage->lock);
     spillage->alloced -= CHUNK_SZ;
-    UNLOCK_MUTEX(&spillage->lock);
+  }
+  UNLOCK_MUTEX(&chunks->lock);
+
+  if (NULL != chunk->spill) {
+    if (0 != release_tmp(chunk->spill, spillage, chunks)) return -1;
   }
   free(chunk);
 
@@ -1102,7 +1084,7 @@ static int release_chunks(ChunkList *chunks, Chunk *chunk,
 
 static inline int wait_or_spill(Opts *options, SpillControl *spillage) {
   double now;
-  if (options->wait_time <= 0 || spillage->pipe_list_head != NULL) return 0;
+  if (options->wait_time <= 0 || spillage->pipe_list_head == NULL) return 0;
   if (spillage->pipe_list_head->is_reg) {
     /* Slowest output is a regular file in multi-thread mode,
        don't want to spill anything for this so always wait */
@@ -1151,40 +1133,41 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
 		       ChunkList *chunks, int *read_eof, int nrefs) {
   ssize_t bytes;
 
-  LOCK_MUTEX(&spillage->lock);
+  LOCK_MUTEX(&chunks->lock);
   spillage->blocking_output = NULL;
   if (options->use_threads) {
     /* Check that the outputs are keeping up if in threaded mode.
        If not, wait until an output writes something. */
     if (in->pos - spillage->max_all > CHUNK_SZ * 20
-	|| (spillage->npipes > 0 && in->pos - spillage->max_pipe > CHUNK_SZ * 20)) {
+	|| (spillage->npipes > 0
+	    && in->pos - spillage->max_pipe > CHUNK_SZ * 20)) {
       spillage->blocking_output = ANY_OUTPUT;
-      UNLOCK_MUTEX(&spillage->lock);
+      UNLOCK_MUTEX(&chunks->lock);
       return 1;
     }
   }
-  UNLOCK_MUTEX(&spillage->lock);
+  UNLOCK_MUTEX(&chunks->lock);
 
   assert(NULL != chunks->tail->data);
 
   if (chunks->tail->len == CHUNK_SZ) {
 
-    LOCK_MUTEX(&spillage->lock);
+    LOCK_MUTEX(&chunks->lock);
     if (spillage->alloced >= options->max) {
       /* Run out of memory, check if the reader should wait or start
 	 spilling data */
       int r = wait_or_spill(options, spillage);
-      UNLOCK_MUTEX(&spillage->lock);
+      UNLOCK_MUTEX(&chunks->lock);
       if (r) return r; /* Decided to wait */
       if (0 != spill_data(options, chunks, spillage)) return -1;
     } else {
-      UNLOCK_MUTEX(&spillage->lock);
+      UNLOCK_MUTEX(&chunks->lock);
     }
 
     /* Need to start a new Chunk */
     if (0 != new_chunk(chunks, nrefs)) return -1;
 
-    LOCK_MUTEX(&spillage->lock);
+    LOCK_MUTEX(&chunks->lock);
     if (NULL != spillage->spill && !spillage->spill->is_tmp) {
       /* Set starting offset for spillage purposes */
       chunks->tail->spill_offset = in->pos;
@@ -1195,7 +1178,7 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
     if (spillage->alloced > spillage->max_alloced) {
       spillage->max_alloced = spillage->alloced;
     }
-    UNLOCK_MUTEX(&spillage->lock);
+    UNLOCK_MUTEX(&chunks->lock);
   }
 
   /* Read some data */ 
@@ -1211,10 +1194,6 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
 	    options->in_name, strerror(errno));
     return -1;
   }
-
-  LOCK_MUTEX(&chunks->lock);
-  chunks->read_count++;
-  UNLOCK_MUTEX(&chunks->lock);
 
   if (bytes == 0) { /* EOF */
     *read_eof = 1;
@@ -1265,7 +1244,6 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
   data           = curr_chunk->data;
   UNLOCK_MUTEX(&chunks->lock);
 
-
   while (next_chunk != NULL || output->offset < curr_chunk_len) {
     /* While there's something to write ... */
 
@@ -1292,7 +1270,7 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
       if (b == 0) break;  /* Wrote nothing, try again later */
 
       /* Update amount written */
-      LOCK_MUTEX(&spillage->lock); /*spillage due to linked list update below*/
+      LOCK_MUTEX(&chunks->lock);
       {
 	int do_broadcast = 0;
 	output->written += b;
@@ -1305,25 +1283,19 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
 	  do_broadcast = 1;
 	}
 	if (do_broadcast) {
-#ifdef HAVE_PTHREADS
-	  int r;
-	  if (0 != (r = pthread_cond_signal(&spillage->data_written))) {
-	    fprintf(stderr, "pthread_cond_signal : %s\n", strerror(r));
-	    abort();
-	  }
-#endif
+	  COND_SIGNAL(&chunks->data_written);
 	}
       }
-      UNLOCK_MUTEX(&spillage->lock);
+      UNLOCK_MUTEX(&chunks->lock);
       output->offset += b;
       bytes += b;
 
       /* Record time and update linked list */
       if (!output->is_reg || options->use_threads) {
-	LOCK_MUTEX(&spillage->lock);
+	LOCK_MUTEX(&chunks->lock);
 	output->write_time = get_time();
 	if (output->write_time < 0) {
-	  UNLOCK_MUTEX(&spillage->lock);
+	  UNLOCK_MUTEX(&chunks->lock);
 	  return -1;
 	}
 	
@@ -1335,19 +1307,12 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
 	  pipe_list_insert(output, n, spillage);
 	}
 
-	if (output == spillage->blocking_output) {
-#ifdef HAVE_PTHREADS
-	  int r;
-#endif
+	if (output == spillage->blocking_output
+	    || spillage->blocking_output == ANY_OUTPUT) {
 	  spillage->blocking_output = spillage->pipe_list_head;
-#ifdef HAVE_PTHREADS
-	  if (0 != (r = pthread_cond_signal(&spillage->data_written))) {
-	    fprintf(stderr, "pthread_cond_signal : %s\n", strerror(r));
-	    abort();
-	  }
-#endif
+	  COND_SIGNAL(&chunks->data_written);
 	}
-	UNLOCK_MUTEX(&spillage->lock);
+	UNLOCK_MUTEX(&chunks->lock);
       }
     }
 
@@ -1447,7 +1412,7 @@ static int do_copy(Opts *options, Input *in,
 		   int npipes, int *pipes,
 		   SpillControl *spillage) {
   ChunkList chunks = {
-    NULL, NULL, NULL, 0, NULL, 0,
+    NULL, NULL, NULL, 0, NULL,
 #ifdef HAVE_PTHREADS
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
     PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER
@@ -1928,12 +1893,10 @@ void * run_write_thread(void *v) {
     goto out;
   }
 
-  LOCK_MUTEX(&spillage->lock);
+  LOCK_MUTEX(&chunks->lock);
   output->is_reg = is_reg;
   if (is_reg) spillage->npipes--;
-  UNLOCK_MUTEX(&spillage->lock);
 
-  LOCK_MUTEX(&chunks->lock);
   /* Wait for some data */
   while (NULL == chunks->head && !chunks->read_eof) {
     res = pthread_cond_wait(&chunks->new_data, &chunks->lock);
@@ -1989,11 +1952,9 @@ void * run_write_thread(void *v) {
   output->fd = -1;
 
  out:
-  LOCK_MUTEX(&spillage->lock);
+  LOCK_MUTEX(&chunks->lock);
   pipe_list_remove(output, spillage);
   if (!output->is_reg) spillage->npipes--;
-  UNLOCK_MUTEX(&spillage->lock);
-  LOCK_MUTEX(&chunks->lock);
   output->next = chunks->closed;
   chunks->closed = output;
   UNLOCK_MUTEX(&chunks->lock);
@@ -2052,15 +2013,13 @@ int do_thread_copy(Opts *options, Input *in, int noutputs, Output *outputs,
     return -1;
   }
 
+  LOCK_MUTEX(&chunks->lock);
   for (;;) {
     Output *closed;
 
-    LOCK_MUTEX(&chunks->lock);
     closed   = chunks->closed;
     chunks->closed = NULL;
     UNLOCK_MUTEX(&chunks->lock);
-
-    if (read_eof) break;
 
     while (NULL != closed) {
       /* deal with closed outputs */
@@ -2085,36 +2044,30 @@ int do_thread_copy(Opts *options, Input *in, int noutputs, Output *outputs,
       read_eof = 1;
     }
 
+    LOCK_MUTEX(&chunks->lock);
     if (read_eof) {
-      LOCK_MUTEX(&chunks->lock);
       chunks->read_eof = read_eof;
       UNLOCK_MUTEX(&chunks->lock);
       break;
     }
 
-    LOCK_MUTEX(&chunks->lock);
-    if (0 != (r = pthread_cond_broadcast(&chunks->new_data))) {
-      fprintf(stderr, "pthread_cond_broadcast : %s\n", strerror(errno));
-      abort();
-    }
-    UNLOCK_MUTEX(&chunks->lock);
+    if (0 == b) COND_BROADCAST(&chunks->new_data);
 
-    LOCK_MUTEX(&spillage->lock);
     if (NULL != spillage->blocking_output) {
       /* Pause while we wait for a slow output to catch up.
 	 do_read should have set b to 1 or 2 depending on if we want to
 	 wait indefinitely or with a time-out. */
       r = 0;
       if (b == 1) {
-	r = pthread_cond_wait(&spillage->data_written, &spillage->lock);
+	r = pthread_cond_wait(&chunks->data_written, &chunks->lock);
       } else {
 	double now = get_time();
 	if (now >= 0 &&
 	    now - spillage->pipe_list_head->write_time < options->wait_time) {
 	  struct timespec timeout;
 	  calc_timeout(&timeout, now, options->wait_time);
-	  r = pthread_cond_timedwait(&spillage->data_written,
-				     &spillage->lock, &timeout);
+	  r = pthread_cond_timedwait(&chunks->data_written,
+				     &chunks->lock, &timeout);
 	}
       }
       if (r != 0 && r != ETIMEDOUT && r != EINTR) {
@@ -2122,17 +2075,15 @@ int do_thread_copy(Opts *options, Input *in, int noutputs, Output *outputs,
 	abort();
       }
     }
-    UNLOCK_MUTEX(&spillage->lock);
   }
+  /* Mutex will be unlocked on escaping from the loop above */
 
   /* Wait for remaining data to flush out */
   LOCK_MUTEX(&chunks->lock);
-  if (0 != (r = pthread_cond_broadcast(&chunks->new_data))) {
-    fprintf(stderr, "pthread_cond_broadcast : %s\n", strerror(errno));
-    abort();
-  }
+  COND_BROADCAST(&chunks->new_data);
   UNLOCK_MUTEX(&chunks->lock);
   
+  /* Join any remaining threads */
   if (nclosed < noutputs) {
     for (i = 0; i < noutputs; i++) {
       if (joined[i]) continue;
@@ -2162,12 +2113,9 @@ int main(int argc, char** argv) {
   int    *pipes   = malloc((argc - 1) * sizeof(int));
   SpillControl spillage = {
     NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-#ifdef HAVE_PTHREADS
-    PTHREAD_MUTEX_INITIALIZER
-#endif
   };  /* Spillage info. */
 #ifdef HAVE_PTHREADS
-  ChunkList chunks = { NULL, NULL, NULL, 0, NULL, 0, PTHREAD_MUTEX_INITIALIZER, 
+  ChunkList chunks = { NULL, NULL, NULL, 0, NULL, PTHREAD_MUTEX_INITIALIZER, 
 		       PTHREAD_COND_INITIALIZER,  PTHREAD_COND_INITIALIZER,
 		       PTHREAD_COND_INITIALIZER };
 #endif
