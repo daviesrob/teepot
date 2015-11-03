@@ -1390,6 +1390,50 @@ int cull_index_array(int *index, int nitems) {
 }
 
 /*
+ * Write statistics about how much data was read and written to each output,
+ * and how much data was spilled to temporary files.
+ *
+ * *options  is the Opts struct
+ * *in       is the Input struct for the input file
+ * noutputs  is the number of output files
+ * outputs   is the array of Output structs
+ * *spillage is the SpillControl information
+ */
+
+static void write_stats(Opts *options, Input *in,
+			int noutputs, Output *outputs,
+			SpillControl *spillage) {
+  int i;
+
+  double now = get_time();
+  fprintf(stderr, "%.3f Read %lld bytes (%sB) from input (%s)\n",
+	  now, (long long) in->pos, human_size(in->pos), options->in_name);
+  for (i = 0; i < noutputs; i++) {
+    fprintf(stderr, "%.3f Wrote %lld bytes (%sB) to output #%d (%s)\n",
+	    now, (long long) outputs[i].written,
+	    human_size(outputs[i].written),
+	    i, outputs[i].name);
+  }
+  fprintf(stderr, "%.3f Maximum buffer used = %zd bytes (%sB)\n",
+	  now, spillage->max_alloced, human_size(spillage->max_alloced));
+  if (!in->reg) {
+    fprintf(stderr, "%.3f Spilled %lld bytes (%sB) to temporary files\n",
+	    now, (long long) spillage->total_spilled,
+	    human_size(spillage->total_spilled));
+    if (spillage->total_spilled > 0) {
+      fprintf(stderr, "%.3f Maximum spilled at one time = %lld bytes (%sB)\n",
+	      now, (long long) spillage->max_spilled,
+	      human_size(spillage->max_spilled));
+      fprintf(stderr, "%.3f Total temporary files opened = %d\n",
+	      now, spillage->spill_file_count);
+      fprintf(stderr,
+	      "%.3f Maximum temporary files in use at one time = %d\n",
+	      now, spillage->max_spill_files);
+    }
+  }
+}
+
+/*
  * Do the copies from input to all the outputs.
  *
  * *options  is the Opts struct
@@ -1670,32 +1714,7 @@ static int do_copy(Opts *options, Input *in,
   } while (nclosed < noutputs);
 
   if (verbosity > 0) {
-    double now = get_time();
-    fprintf(stderr, "%.3f Read %lld bytes (%sB) from input (%s)\n",
-	    now, (long long) in->pos, human_size(in->pos), options->in_name);
-    for (i = 0; i < noutputs; i++) {
-      fprintf(stderr, "%.3f Wrote %lld bytes (%sB) to output #%d (%s)\n",
-	      now, (long long) outputs[i].written,
-	      human_size(outputs[i].written),
-	      i, outputs[i].name);
-    }
-    fprintf(stderr, "%.3f Maximum buffer used = %zd bytes (%sB)\n",
-	    now, spillage->max_alloced, human_size(spillage->max_alloced));
-    if (!in->reg) {
-      fprintf(stderr, "%.3f Spilled %lld bytes (%sB) to temporary files\n",
-	      now, (long long) spillage->total_spilled,
-	      human_size(spillage->total_spilled));
-      if (spillage->total_spilled > 0) {
-	fprintf(stderr, "%.3f Maximum spilled at one time = %lld bytes (%sB)\n",
-		now, (long long) spillage->max_spilled,
-		human_size(spillage->max_spilled));
-	fprintf(stderr, "%.3f Total temporary files opened = %d\n",
-		now, spillage->spill_file_count);
-	fprintf(stderr,
-		"%.3f Maximum temporary files in use at one time = %d\n",
-		now, spillage->max_spill_files);
-      }
-    }
+    write_stats(options, in, noutputs, outputs, spillage);
   }
 
   return 0;
@@ -2099,6 +2118,10 @@ int do_thread_copy(Opts *options, Input *in, int noutputs, Output *outputs,
 
   /* paranoia check */
   for (i = 0; i < noutputs; i++) assert(joined[i] != 0);
+
+  if (verbosity > 0) {
+    write_stats(options, in, noutputs, outputs, spillage);
+  }
 
   return res;
 }
