@@ -131,8 +131,10 @@ typedef struct ChunkList {
   Chunk *head;    /* List head */
   Chunk *spilled; /* Last chunk to be spilled to a file */
   Chunk *tail;    /* List tail */
-  int    read_eof; /* Reading finished (threaded mode only) */
   Output *closed;  /* Closed outputs (threaded mode only) */
+  int    read_eof; /* Reading finished (threaded mode only) */
+  int    waiting_outputs; /* No. of outputs waiting on conditionals */
+  int    waiting_input;   /* Input waiting on a conditional */
 #ifdef HAVE_PTHREADS
   pthread_mutex_t lock;         /* Global lock for everything */
   pthread_cond_t  new_data;     /* Signalled when new data arrives */
@@ -1282,7 +1284,7 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
 	  spillage->max_pipe = output->written;
 	  do_broadcast = 1;
 	}
-	if (do_broadcast) {
+	if (do_broadcast && chunks->waiting_input) {
 	  COND_SIGNAL(&chunks->data_written);
 	}
       }
@@ -1310,7 +1312,7 @@ static ssize_t do_write(Output *output, ChunkList *chunks,
 	if (output == spillage->blocking_output
 	    || spillage->blocking_output == ANY_OUTPUT) {
 	  spillage->blocking_output = spillage->pipe_list_head;
-	  COND_SIGNAL(&chunks->data_written);
+	  if (chunks->waiting_input) COND_SIGNAL(&chunks->data_written);
 	}
 	UNLOCK_MUTEX(&chunks->lock);
       }
@@ -1456,7 +1458,7 @@ static int do_copy(Opts *options, Input *in,
 		   int npipes, int *pipes,
 		   SpillControl *spillage) {
   ChunkList chunks = {
-    NULL, NULL, NULL, 0, NULL,
+    NULL, NULL, NULL, NULL, 0, 0, 0,
 #ifdef HAVE_PTHREADS
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
     PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER
@@ -1918,7 +1920,9 @@ void * run_write_thread(void *v) {
 
   /* Wait for some data */
   while (NULL == chunks->head && !chunks->read_eof) {
+    chunks->waiting_outputs++;
     res = pthread_cond_wait(&chunks->new_data, &chunks->lock);
+    chunks->waiting_outputs--;
     if (res != 0 && res != EINTR) {
       fprintf(stderr, "pthread_cond_wait : %s\n", strerror(res));
       abort();
@@ -1944,7 +1948,9 @@ void * run_write_thread(void *v) {
 	UNLOCK_MUTEX(&chunks->lock);
 	break;
       } else {        /* Wait for more data */
+	chunks->waiting_outputs++;
 	res = pthread_cond_wait(&chunks->new_data, &chunks->lock);
+	chunks->waiting_outputs--;
 	if (res != 0) {
 	  fprintf(stderr, "pthread_cond_wait : %s\n", strerror(res));
 	  abort();
@@ -2070,7 +2076,9 @@ int do_thread_copy(Opts *options, Input *in, int noutputs, Output *outputs,
       break;
     }
 
-    if (0 == b) COND_BROADCAST(&chunks->new_data);
+    if (0 == b && chunks->waiting_outputs > 0) {
+      COND_BROADCAST(&chunks->new_data);
+    }
 
     if (NULL != spillage->blocking_output) {
       /* Pause while we wait for a slow output to catch up.
@@ -2078,15 +2086,19 @@ int do_thread_copy(Opts *options, Input *in, int noutputs, Output *outputs,
 	 wait indefinitely or with a time-out. */
       r = 0;
       if (b == 1) {
+	chunks->waiting_input++;
 	r = pthread_cond_wait(&chunks->data_written, &chunks->lock);
+	chunks->waiting_input--;
       } else {
 	double now = get_time();
 	if (now >= 0 &&
 	    now - spillage->pipe_list_head->write_time < options->wait_time) {
 	  struct timespec timeout;
 	  calc_timeout(&timeout, now, options->wait_time);
+	  chunks->waiting_input++;
 	  r = pthread_cond_timedwait(&chunks->data_written,
 				     &chunks->lock, &timeout);
+	  chunks->waiting_input--;
 	}
       }
       if (r != 0 && r != ETIMEDOUT && r != EINTR) {
@@ -2138,9 +2150,9 @@ int main(int argc, char** argv) {
     NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   };  /* Spillage info. */
 #ifdef HAVE_PTHREADS
-  ChunkList chunks = { NULL, NULL, NULL, 0, NULL, PTHREAD_MUTEX_INITIALIZER, 
-		       PTHREAD_COND_INITIALIZER,  PTHREAD_COND_INITIALIZER,
-		       PTHREAD_COND_INITIALIZER };
+  ChunkList chunks = { NULL, NULL, NULL, NULL, 0, 0, 0,
+		       PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
+		       PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER };
 #endif
   int     nregular = 0, npipes = 0;
   struct sigaction sig;
