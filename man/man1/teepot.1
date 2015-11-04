@@ -39,6 +39,17 @@ option.  The default is 1000M.  \fBteepot\fP may write an oversize file if it
 runs out of file descriptors.
 
 .TP
+\fB-p\fP
+.TQ
+\fB-P\fP
+Enable (\fB-p\fP, default) or disable (\fB-P\fP) multi-threaded copy.  This
+makes \fBteepot\fP open a separate thread for each output, which can reduce
+delays in writing data especially on multi-core systems.  It also means
+\fBteepot\fP does not have to wait for all of the outputs to be opened
+before starting to write data.  This option is ignored if \fBteepot\fP was
+not built with threading support.
+
+.TP
 \fB-t\fP \fIdirectory\fP
 Sets the location for temporary files to \fIdirectory\fP.  This needs to have
 enough free space to store all of the data that may be spilled (in the
@@ -64,7 +75,8 @@ spilled immediately.  The maximum permitted value is 2000000 seconds, which
 is approximately 23 days.
 
 .SH BUGS
-\fBteepot\fP will currently block if it one of the outputs is a named pipe that
+\fBteepot\fP in single-threaded mode will block if it one of the outputs is
+a named pipe that
 does not have a reader.  This could lead to deadlocks if it is used as part
 of a complicated pipeline where some processes are slow to open their inputs.
 
