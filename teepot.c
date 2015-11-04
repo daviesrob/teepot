@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 Genome Research Ltd.
+ * Copyright (c) 2014,2015 Genome Research Ltd.
  * Author: Rob Davies <rmd+github@sanger.ac.uk>
  *
  * This file is part of teepot.
@@ -1140,9 +1140,9 @@ static ssize_t do_read(Opts *options, Input *in, SpillControl *spillage,
   if (options->use_threads) {
     /* Check that the outputs are keeping up if in threaded mode.
        If not, wait until an output writes something. */
-    if (in->pos - spillage->max_all > CHUNK_SZ * 20
+    if (in->pos - spillage->max_all > options->max / 2
 	|| (spillage->npipes > 0
-	    && in->pos - spillage->max_pipe > CHUNK_SZ * 20)) {
+	    && in->pos - spillage->max_pipe > options->max / 2)) {
       spillage->blocking_output = ANY_OUTPUT;
       UNLOCK_MUTEX(&chunks->lock);
       return 1;
