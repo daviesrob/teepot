@@ -1883,6 +1883,21 @@ int get_options(int argc, char** argv, Opts *options, int *after_opts) {
 
 #ifdef HAVE_PTHREADS
 
+/*
+ * Runs a writer thread.  This waits for data to arrive and then writes it
+ * out.  It waits on a conditional whenever it runs out of data.  At the
+ * end, it tidies up, puts the output on the chunks->closed linked list
+ * and leaves an exit status in output->res.
+ *
+ * This function is run via pthread_create()
+ *
+ * *v is a ThreadParams struct containing pointers to the Opts, Output,
+ *    SpillControl and ChunkList structs needed by the writer.  It also
+ *    includes an index number for the thread for use in messages.
+ *
+ * Returns NULL
+ */
+
 void * run_write_thread(void *v) {
   ThreadParams *p = (ThreadParams *) v;
   Opts *options          = p->options;
@@ -1987,6 +2002,22 @@ void * run_write_thread(void *v) {
   return NULL;
 }
 
+/*
+ * Start the output threads.  First all the Output structs are initialized,
+ * then the threads are started using pthread_create.
+ *
+ * *options  is the Opts struct
+ * n         is the number of outputs
+ * names     is an array of output file names
+ * outputs   is the array of Output structs
+ * *spillage is the SpillControl information
+ * *chunks   is the ChunkList struct for the chunks linked list.  It also
+ *           includes mutexes and conditionals for thread synchronization.
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
+
 int start_output_threads(Opts *options, int n, char **names, Output *outputs,
 			 SpillControl *spillage, ChunkList *chunks) {
   int i, res;
@@ -2024,6 +2055,29 @@ int start_output_threads(Opts *options, int n, char **names, Output *outputs,
   fprintf(stderr, "Couldn't start output thread #%d: %s\n", i, strerror(res));
   return -1;
 }
+
+/*
+ * Run a multi-threaded copy.  This implements the reading thread, which
+ * reads from the input file descriptor, storing the data in the linked
+ * list of chunks.  If it gets too far ahead, it will either wait on
+ * a conditional for the outputs to catch up; or spill data as necessary.
+ * It cleans up any output threads that finish early using pthread_join
+ * as the read progresses.  When it has finished, it pthread_joins any
+ * remaining threads.  The return status of each output thread is checked,
+ * the return status of this function is set to -1 if any of the output
+ * threads reports a failure.
+ *
+ * *options  is the Opts struct
+ * *in       is the Input struct for the input file.
+ * noutputs  is the number of entries in the outputs array
+ * outputs   is the array of Output structs.
+ * *spillage is the SpillControl information
+ * *chunks   is the ChunkList struct for the chunks linked list.  It also
+ *           includes mutexes and conditionals for thread synchronization.
+ *
+ * Returns  0 on success
+ *         -1 on failure
+ */
 
 int do_thread_copy(Opts *options, Input *in, int noutputs, Output *outputs,
 		   SpillControl *spillage, ChunkList *chunks) {
