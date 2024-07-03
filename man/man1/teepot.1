@@ -6,7 +6,7 @@ teepot \- copy from input to many outputs, with buffering.
 [\fIoptions\fP] [\fI-i <input>\fP] \fI<output1>\fP [\fI<output2> ...\fP]
 .SH DESCRIPTION
 teepot duplicates data from its input to each of its outputs, in a similar
-mannner to \fBtee\fP(1), but with additional buffering to avoid some of the
+manner to \fBtee\fP(1), but with additional buffering to avoid some of the
 deadlock problems that can occur when writing to other processes via pipes.
 It also handles piped outputs that get shut down before all of the data has been sent (for example when writing to \fBhead\fP(1)).
 .PP
